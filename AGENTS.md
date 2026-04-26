@@ -1,4 +1,4 @@
-# ai-log-converter
+# ai-distillery
 
 Collect personal AI tool logs → readable audit trail → daily report → WeCom push → user mental model → methodology Genes.
 
@@ -45,15 +45,16 @@ scripts/extract-gene.sh plan-before-act
 | `make distill` | Distill SOUL.md + LESSONS.md → MEMORY.md rules (structured diff, ≥7 entries threshold) |
 | `make lessons` | Extract lessons learned → LESSONS.md (错题本) |
 | `make gene-health` | Compute Gene freshness, rebuild registry, output health report |
+| `make daily` | Generate daily health report (pure mechanical, no LLM) |
 | `make sync-memory` | Commit and push ai-logs/ to ai-memory remote |
 | `make test` | Run test suite |
-| `make install-cron` | Daily pipeline at 08:47: harvest → report → push → soul → lessons → distill → gene-health → sync-memory |
+| `make install-cron` | Daily pipeline at 08:47: harvest → report → push → soul → lessons → distill → gene-health → daily → sync-memory |
 | `make uninstall-cron` | Remove cron job |
 
 ## Architecture
 
 ```
-ai-log-converter/                    ai-logs/ (= ai-memory repo clone)
+ai-distillery/                       ai-logs/ (= ai-memory repo clone)
 ├── ai_report.py     (pipeline)     ├── MEMORY.md        (rules)
 ├── ai_engine.py     (LLM backend)  ├── LESSONS.md       (lessons)
 ├── ai_prompts.py    (prompts)      ├── SOUL.md          (observations)
@@ -87,6 +88,7 @@ WECOM_WEBHOOK_URL=https://...    # optional, for push
 - `distill [--force] [--soul FILE] [--memory FILE] [--lessons FILE]` — distill SOUL.md + LESSONS.md → MEMORY.md rules (structured diff, Gene promotion suggestions)
 - `lessons [--date YYYY-MM-DD] [--lessons FILE]` — extract lessons learned → LESSONS.md (错题本: 坑/因/法 + area tags)
 - `gene-health [--genes-dir DIR]` — compute Gene freshness (decay model), rebuild registry.json, output health report
+- `daily [--date YYYY-MM-DD]` — daily health report: knowledge summary, promotion candidates, duplicate detection, rule freshness, pipeline health (no LLM)
 - `sync-memory [--logs DIR]` — commit and push ai-logs/ to ai-memory remote
 
 ## Taste Rules

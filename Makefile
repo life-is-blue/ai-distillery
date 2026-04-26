@@ -1,4 +1,4 @@
-.PHONY: test clean harvest report push soul distill lessons gene-health sync-memory install-cron uninstall-cron
+.PHONY: test clean harvest report push soul distill lessons gene-health daily sync-memory install-cron uninstall-cron
 
 LOGS     := $(CURDIR)/ai-logs
 CONVERTER := python3 ai_log_converter.py
@@ -79,13 +79,16 @@ lessons:
 gene-health:
 	@python3 ai_report.py gene-health --genes-dir $(LOGS)/.genes
 
+daily:
+	@python3 ai_report.py daily --logs $(LOGS)
+
 sync-memory:
 	@python3 ai_report.py sync-memory --logs $(LOGS)
 
 install-cron:
-	@(crontab -l 2>/dev/null | grep -v 'ai-log-converter'; echo "47 8 * * * cd $(CURDIR) && make harvest && make report && make push && make soul && make lessons && make distill && make gene-health && make sync-memory >> /tmp/ai-report.log 2>&1") | crontab -
-	@echo "Cron installed: daily harvest+report+push+soul+lessons+distill+gene-health+sync-memory at 08:47"
+	@(crontab -l 2>/dev/null | grep -v 'ai-distillery-cron'; echo "47 8 * * * cd $(CURDIR) && make harvest && make report && make push && make soul && make lessons && make distill && make gene-health && make daily && make sync-memory >> /tmp/ai-report.log 2>&1 # ai-distillery-cron") | crontab -
+	@echo "Cron installed: daily harvest+report+push+soul+lessons+distill+gene-health+daily+sync-memory at 08:47"
 
 uninstall-cron:
-	@crontab -l 2>/dev/null | grep -v 'ai-log-converter' | crontab -
+	@crontab -l 2>/dev/null | grep -v 'ai-distillery-cron' | crontab -
 	@echo "Cron removed"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ai-log-converter - v2.1.0
+ai-distillery / ai-log-converter - v2.1.0
 "Talk is cheap. Show me the code."
 
 Convert AI conversation logs (Claude, Gemini, CodeBuddy, Codex) to readable formats.
@@ -199,7 +199,7 @@ def detect_format(samples: Iterable[dict]) -> Optional[str]:
     return None
 
 def main():
-    parser = argparse.ArgumentParser(description="ai-log-converter: Convert AI conversation logs to readable formats")
+    parser = argparse.ArgumentParser(description="ai-distillery: Convert AI conversation logs to readable formats")
     parser.add_argument("input", nargs="?", default="-")
     parser.add_argument("output", nargs="?", default="-")
     parser.add_argument("-f", "--format", choices=list(MAPPER_REGISTRY.keys()))

@@ -1003,8 +1003,11 @@ def cmd_push(args):
     if not webhook:
         print("WECOM_WEBHOOK_URL not set, skip push", file=sys.stderr); return
     reports_dir = Path(args.logs) / "reports"
-    # Find the most recently modified report file
-    reports = sorted(reports_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    # Find the most recently modified work report (YYYY-MM-DD.md only, exclude daily-health-*)
+    reports = sorted(
+        [p for p in reports_dir.glob("*.md") if re.match(r'\d{4}-\d{2}-\d{2}\.md$', p.name)],
+        key=lambda p: p.stat().st_mtime, reverse=True
+    )
     if not reports:
         print("No reports found", file=sys.stderr); return
     report_text = reports[0].read_text(encoding="utf-8")
@@ -1019,6 +1022,303 @@ def cmd_push(args):
         print(f"Pushed {reports[0].name} to WeCom", file=sys.stderr)
     except Exception as e:
         print(f"Push failed: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# cmd_daily — pure mechanical health report (no LLM)
+# ---------------------------------------------------------------------------
+
+def _tokenize_bigram(text: str) -> set[str]:
+    """CJK bigram + Latin word tokenizer for Jaccard similarity."""
+    # Extract Latin words and CJK characters
+    tokens = re.findall(r'[一-鿿]|[a-zA-Z0-9_]+', text.lower())
+    # Build bigrams from adjacent CJK characters
+    result = set()
+    cjk_buf = []
+    for tok in tokens:
+        if len(tok) == 1 and '一' <= tok <= '鿿':
+            cjk_buf.append(tok)
+        else:
+            # Flush CJK buffer as bigrams
+            for i in range(len(cjk_buf) - 1):
+                result.add(cjk_buf[i] + cjk_buf[i + 1])
+            cjk_buf = []
+            if len(tok) > 1:
+                result.add(tok)
+    # Flush remaining CJK
+    for i in range(len(cjk_buf) - 1):
+        result.add(cjk_buf[i] + cjk_buf[i + 1])
+    return result
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _parse_all_lesson_pits(lessons_path: Path) -> list[tuple[str, str]]:
+    """Extract (slug, pit_text) from ALL LESSONS.md entries (regardless of absorbed status)."""
+    if not lessons_path.exists():
+        return []
+    content = lessons_path.read_text(encoding="utf-8")
+    entries = re.split(r'(?=^## [\w-]+$)', content, flags=re.M)
+    result = []
+    for entry in entries:
+        m = re.match(r'^## ([\w-]+)', entry.strip())
+        if not m:
+            continue
+        slug = m.group(1)
+        pit_m = re.search(r'\*\*坑\*\*[：:]\s*(.+)', entry)
+        if pit_m:
+            result.append((slug, pit_m.group(1).strip()))
+    return result
+
+
+def _count_memory_rules(memory_path: Path) -> dict[str, int]:
+    """Count rules per section in MEMORY.md."""
+    counts = {"MUST": 0, "MUST NOT": 0, "PREFER": 0, "CONTEXT": 0}
+    if not memory_path.exists():
+        return counts
+    content = memory_path.read_text(encoding="utf-8")
+    current_section = None
+    for line in content.splitlines():
+        if line.startswith("## "):
+            section = line[3:].strip()
+            if section in counts:
+                current_section = section
+            else:
+                current_section = None
+        elif current_section and line.strip().startswith("- "):
+            counts[current_section] += 1
+    return counts
+
+
+def _check_rule_freshness(memory_path: Path, soul_path: Path) -> list[tuple[str, str]]:
+    """Check which MEMORY.md rules have recent evidence in SOUL.md (last 30 days).
+    Uses pk tags as bridge. Returns [(rule_text, status)] where status is 'evidenced' or 'stale'."""
+    if not memory_path.exists() or not soul_path.exists():
+        return []
+    # Collect pk tags from recent 30 days in SOUL.md
+    cutoff = date.today() - timedelta(days=30)
+    soul_content = soul_path.read_text(encoding="utf-8")
+    recent_pks = set()
+    entries = re.split(r'(?=\n### \d{4}-\d{2}-\d{2}\n)', soul_content)
+    for entry in entries:
+        m = re.match(r'\n### (\d{4}-\d{2}-\d{2})\n', entry)
+        if not m:
+            continue
+        try:
+            entry_date = date.fromisoformat(m.group(1))
+        except ValueError:
+            continue
+        if entry_date >= cutoff:
+            for pk_m in re.finditer(r'<!--\s*pk:\s*([\w-]+)\s*-->', entry):
+                recent_pks.add(pk_m.group(1))
+
+    # Check each rule against recent pks
+    memory_content = memory_path.read_text(encoding="utf-8")
+    results = []
+    for line in memory_content.splitlines():
+        line_s = line.strip()
+        if not line_s.startswith("- "):
+            continue
+        rule_text = line_s[2:].strip()
+        # Check if any recent pk keyword appears in rule text
+        found = False
+        for pk in recent_pks:
+            # pk is kebab-case like "plan-before-act"; check each word
+            for word in pk.split("-"):
+                if len(word) > 2 and word.lower() in rule_text.lower():
+                    found = True
+                    break
+            if found:
+                break
+        results.append((rule_text, "evidenced" if found else "stale"))
+    return results
+
+
+def cmd_daily(args):
+    """Generate daily health report — pure mechanical analysis, no LLM."""
+    logs_dir = Path(args.logs)
+    target_date = args.date or date.today()
+    soul_path = logs_dir / "SOUL.md"
+    lessons_path = logs_dir / "LESSONS.md"
+    memory_path = logs_dir / "MEMORY.md"
+    genes_dir = logs_dir / ".genes"
+    reports_dir = logs_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    out_path = reports_dir / f"daily-health-{target_date}.md"
+
+    sections = []
+    todos = []
+
+    # --- Section 1: 知识库摘要 ---
+    s1 = [f"## 1. 知识库摘要\n"]
+    # SOUL.md
+    soul_total = soul_unabsorbed = soul_today = 0
+    if soul_path.exists():
+        sc = soul_path.read_text(encoding="utf-8")
+        soul_total = len(re.findall(r'^### \d{4}-\d{2}-\d{2}$', sc, re.M))
+        soul_unabsorbed = sc.count("absorbed: false")
+        soul_today = len(re.findall(rf'^### {target_date}$', sc, re.M))
+    # LESSONS.md
+    les_total = les_absorbed = les_unabsorbed = les_review = 0
+    if lessons_path.exists():
+        lc = lessons_path.read_text(encoding="utf-8")
+        les_total = len(re.findall(r'^## [\w-]+$', lc, re.M))
+        les_absorbed = lc.count("absorbed: true")
+        les_review = lc.count("needs-review")
+        les_unabsorbed = lc.count("absorbed: false")
+    # MEMORY.md
+    mem_counts = _count_memory_rules(memory_path)
+    mem_total = sum(mem_counts.values())
+    # Genes
+    gene_active = gene_stale = gene_degraded = 0
+    reg_path = genes_dir / "registry.json"
+    if reg_path.exists():
+        try:
+            reg = json.loads(reg_path.read_text(encoding="utf-8"))
+            for g in reg.get("genes", []):
+                s = g.get("decay_status", "")
+                if s == "active": gene_active += 1
+                elif s == "stale": gene_stale += 1
+                elif s == "degraded": gene_degraded += 1
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    s1.append(f"| 知识库 | 总计 | 详情 |")
+    s1.append(f"|--------|------|------|")
+    s1.append(f"| SOUL.md | {soul_total} 条观察 | 今日 +{soul_today}, unabsorbed {soul_unabsorbed} |")
+    s1.append(f"| LESSONS.md | {les_total} 条教训 | absorbed {les_absorbed}, unabsorbed {les_unabsorbed}, needs-review {les_review} |")
+    s1.append(f"| MEMORY.md | {mem_total} 条规则 | MUST {mem_counts['MUST']}, MUST_NOT {mem_counts['MUST NOT']}, PREFER {mem_counts['PREFER']}, CONTEXT {mem_counts['CONTEXT']} |")
+    s1.append(f"| .genes/ | {gene_active + gene_stale + gene_degraded} 个 Gene | active {gene_active}, stale {gene_stale}, degraded {gene_degraded} |")
+    sections.append("\n".join(s1))
+    if gene_stale:
+        todos.append(f"审查 {gene_stale} 个 stale Gene")
+    if gene_degraded:
+        todos.append(f"处理 {gene_degraded} 个 degraded Gene")
+    if les_review:
+        todos.append(f"审查 {les_review} 条 needs-review 教训")
+
+    # --- Section 2: 提升候选 ---
+    s2 = ["## 2. 提升候选\n"]
+    pattern_counts = extract_pattern_counts(soul_path, lessons_path)
+    candidates = [(pk, cnt) for pk, cnt in pattern_counts.items() if cnt >= 3]
+    if candidates:
+        for pk, cnt in candidates:
+            s2.append(f"- `{pk}` ({cnt} 天) → 可提取为 Gene: `scripts/extract-gene.sh {pk}`")
+        todos.append(f"评估 {len(candidates)} 个 Gene 晋升候选")
+    else:
+        s2.append("无候选（需 pk ≥ 3 天）")
+    sections.append("\n".join(s2))
+
+    # --- Section 3: 潜在重复检测 ---
+    s3 = ["## 3. 潜在重复检测\n"]
+    pits = _parse_all_lesson_pits(lessons_path)
+    duplicates = []
+    for i in range(len(pits)):
+        tokens_i = _tokenize_bigram(pits[i][1])
+        for j in range(i + 1, len(pits)):
+            sim = _jaccard(tokens_i, _tokenize_bigram(pits[j][1]))
+            if sim >= 0.5:
+                duplicates.append((pits[i][0], pits[j][0], round(sim, 2)))
+    if duplicates:
+        for a, b, sim in duplicates:
+            s3.append(f"- `{a}` ↔ `{b}` (相似度 {sim:.0%})")
+        todos.append(f"检查 {len(duplicates)} 对潜在重复教训")
+    else:
+        s3.append("未发现重复")
+    sections.append("\n".join(s3))
+
+    # --- Section 4: LESSONS 分布统计 ---
+    s4 = ["## 4. LESSONS 分布统计\n"]
+    month_counts: dict[str, int] = {}
+    if lessons_path.exists():
+        for m in re.finditer(r'>\s*(\d{4}-\d{2})-\d{2}\s*\|', lessons_path.read_text(encoding="utf-8")):
+            ym = m.group(1)
+            month_counts[ym] = month_counts.get(ym, 0) + 1
+    if month_counts:
+        s4.append("| 月份 | 新增 |")
+        s4.append("|------|------|")
+        for ym in sorted(month_counts):
+            s4.append(f"| {ym} | {month_counts[ym]} |")
+    else:
+        s4.append("暂无数据")
+    # High-value: pk≥3 days AND unabsorbed
+    hv = [(pk, cnt) for pk, cnt in pattern_counts.items()
+          if cnt >= 3 and any(pk in t for _, t in extract_unabsorbed_lessons(lessons_path))]
+    if hv:
+        s4.append(f"\n**高价值未吸收**: {', '.join(f'`{pk}`({cnt}天)' for pk, cnt in hv)}")
+    sections.append("\n".join(s4))
+
+    # --- Section 5: Gene 健康 ---
+    s5 = ["## 5. Gene 健康\n"]
+    if reg_path.exists():
+        try:
+            reg = json.loads(reg_path.read_text(encoding="utf-8"))
+            genes = reg.get("genes", [])
+            if genes:
+                s5.append("| Gene | 状态 | 新鲜度 |")
+                s5.append("|------|------|--------|")
+                for g in genes:
+                    s5.append(f"| {g.get('name', '?')} | {g.get('decay_status', '?')} | {g.get('freshness_score', '?')} |")
+            else:
+                s5.append("无 Gene")
+        except (json.JSONDecodeError, KeyError):
+            s5.append("registry.json 解析失败")
+    else:
+        s5.append("无 .genes/ 目录")
+    sections.append("\n".join(s5))
+
+    # --- Section 6: MEMORY.md 规则新鲜度 ---
+    s6 = ["## 6. 规则新鲜度\n"]
+    freshness = _check_rule_freshness(memory_path, soul_path)
+    stale_rules = [(r, s) for r, s in freshness if s == "stale"]
+    if freshness:
+        evidenced_n = sum(1 for _, s in freshness if s == "evidenced")
+        s6.append(f"- 有近期证据: {evidenced_n}/{len(freshness)}")
+        s6.append(f"- 可能过时: {len(stale_rules)}/{len(freshness)}")
+        if stale_rules:
+            s6.append("\n**可能过时的规则**:")
+            for r, _ in stale_rules[:5]:
+                s6.append(f"- {r[:80]}...")
+            if len(stale_rules) > 5:
+                s6.append(f"- ...及其他 {len(stale_rules) - 5} 条")
+            todos.append(f"审查 {len(stale_rules)} 条可能过时的规则")
+    else:
+        s6.append("MEMORY.md 为空或无规则")
+    sections.append("\n".join(s6))
+
+    # --- Section 7: 蒸馏链路健康 ---
+    s7 = ["## 7. 蒸馏链路健康（最近 7 天）\n"]
+    s7.append("| 日期 | Sessions | 日报 | SOUL | LESSONS |")
+    s7.append("|------|----------|------|------|---------|")
+    soul_content = soul_path.read_text(encoding="utf-8") if soul_path.exists() else ""
+    lessons_content = lessons_path.read_text(encoding="utf-8") if lessons_path.exists() else ""
+    for d in range(7):
+        day = target_date - timedelta(days=d)
+        n_sessions = len(find_sessions(logs_dir, day))
+        has_report = (reports_dir / f"{day}.md").exists()
+        has_soul = f"### {day}" in soul_content
+        n_lessons = len(re.findall(rf'>\s*{day}\s*\|', lessons_content))
+        s7.append(f"| {day} | {n_sessions} | {'✓' if has_report else '—'} | {'✓' if has_soul else '—'} | +{n_lessons} |")
+    sections.append("\n".join(s7))
+
+    # --- Section 8: 待办事项 ---
+    s8 = ["## 8. 待办事项\n"]
+    if todos:
+        for i, t in enumerate(todos, 1):
+            s8.append(f"{i}. {t}")
+    else:
+        s8.append("无待办 — 一切正常")
+    sections.append("\n".join(s8))
+
+    # Write report
+    header = f"# Daily Health Report — {target_date}\n"
+    content = header + "\n\n".join(sections) + "\n"
+    out_path.write_text(content, encoding="utf-8")
+    print(f"OK {out_path}", file=sys.stderr)
 
 
 def cmd_sync_memory(args):
@@ -1081,12 +1381,15 @@ def main():
     le.add_argument("--lessons", default=str(Path(default_logs) / "LESSONS.md"))
     gh = sub.add_parser("gene-health")
     gh.add_argument("--genes-dir", default=str(Path(default_logs) / ".genes"))
+    da = sub.add_parser("daily")
+    da.add_argument("--logs", default=default_logs)
+    da.add_argument("--date", type=date.fromisoformat, default=None)
     sm = sub.add_parser("sync-memory")
     sm.add_argument("--logs", default=default_logs)
     args = p.parse_args()
     {"report": cmd_report, "soul": cmd_soul, "push": cmd_push,
      "distill": cmd_distill, "lessons": cmd_lessons,
-     "gene-health": cmd_gene_health,
+     "gene-health": cmd_gene_health, "daily": cmd_daily,
      "sync-memory": cmd_sync_memory}[args.cmd](args)
 
 
