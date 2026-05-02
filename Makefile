@@ -1,4 +1,4 @@
-.PHONY: test clean harvest report push soul dream distill lessons gene-health daily sync-memory install-cron uninstall-cron
+.PHONY: test clean harvest report push soul dream distill lessons gene-health daily sync-memory install-cron uninstall-cron backfill-soul setup
 
 LOGS     := $(CURDIR)/ai-logs
 CONVERTER := python3 ai_log_converter.py
@@ -95,3 +95,69 @@ install-cron:
 uninstall-cron:
 	@crontab -l 2>/dev/null | grep -v 'ai-distillery-cron' | crontab -
 	@echo "Cron removed"
+
+backfill-soul:
+	@echo "Backfilling SOUL.md from historical sessions (top 8 dates by session count)..."
+	@python3 -c "\
+import sys; sys.path.insert(0, '.'); \
+from pathlib import Path; from collections import Counter; \
+from ai_report import find_sessions, session_days; \
+from datetime import date; \
+logs = Path('ai-logs'); \
+day_counts = Counter(); \
+[day_counts.__setitem__(d, day_counts.get(d, 0) + 1) \
+    for p in logs.rglob('*.jsonl') if 'reports' not in p.parts \
+    for d in session_days(p)]; \
+top_days = sorted(day_counts.items(), key=lambda x: -x[1])[:8]; \
+print(f'Top {len(top_days)} dates by session count:'); \
+[print(f'  {d}: {n} sessions') for d, n in top_days]; \
+open('/tmp/backfill-dates.txt','w').write('\n'.join(str(d) for d,_ in top_days))"
+	@while IFS= read -r d; do \
+		echo "--- Soul extracting: $$d ---"; \
+		python3 ai_report.py soul --date "$$d" --logs $(LOGS) --soul $(LOGS)/SOUL.md || true; \
+		sleep 2; \
+	done < /tmp/backfill-dates.txt
+	@echo "Backfill complete. Run 'make dream' to consolidate."
+
+setup:
+	@echo "=== ai-distillery setup ==="
+	@echo ""
+	@python3 --version || (echo "ERROR: python3 not found" && exit 1)
+	@python3 -c "import sys; assert sys.version_info >= (3, 10), f'Need Python 3.10+, got {sys.version}'" || exit 1
+	@echo "✓ Python OK"
+	@echo ""
+	@if [ ! -f .env ]; then \
+		echo "Creating .env template..."; \
+		printf '# ai-distillery configuration\nLLM_API_KEY=your-api-key-here\n# LLM_BASE_URL=https://api.openai.com/v1\n# LLM_MODEL_NAME=gpt-4o-mini\n# WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx\n' > .env; \
+		echo "✓ .env created — EDIT IT with your API key before continuing"; \
+		echo ""; \
+		exit 1; \
+	else \
+		echo "✓ .env exists"; \
+	fi
+	@echo ""
+	@if [ ! -d ai-logs/.git ]; then \
+		echo "WARNING: ai-logs/ is not a git repository."; \
+		echo "  To connect to your ai-memory repo:"; \
+		echo "    git clone <your-ai-memory-repo-url> ai-logs"; \
+		echo "  Or to start fresh:"; \
+		echo "    mkdir -p ai-logs && cd ai-logs && git init"; \
+		echo ""; \
+	else \
+		echo "✓ ai-logs/ is a git repo"; \
+	fi
+	@echo ""
+	@python3 -c "from ai_report import main; from ai_prompts import SOUL_SYSTEM; print('✓ Imports OK')"
+	@echo ""
+	@echo "Installing cron job..."
+	@$(MAKE) install-cron
+	@echo ""
+	@echo "Running initial harvest..."
+	@$(MAKE) harvest 2>/dev/null || true
+	@echo ""
+	@echo "=== Setup complete ==="
+	@echo "Next steps:"
+	@echo "  1. Edit .env with your LLM API key"
+	@echo "  2. Run 'make soul' to test extraction"
+	@echo "  3. Run 'make backfill-soul' to process historical data"
+	@echo "  4. Cron will run daily at 08:47"
