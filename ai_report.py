@@ -167,9 +167,20 @@ def quality_gate(observations: str) -> str:
 
 
 def grounding_check(observations: str, user_turns: str) -> str:
-    """LLM-as-judge: verify each observation bullet is grounded in actual user messages.
-    Returns only GROUNDED bullets. Empty string if nothing survives.
-    Pattern-key tags (<!-- pk: xxx -->) are stripped before grounding and re-attached after."""
+    """Verify structured SOUL observations against user messages.
+
+    Operates at ENTRY level (not line level):
+    - Parses observations into (section, entry) pairs using _parse_soul_sections.
+    - Each entry may span multiple lines (e.g., Preferences with Why/How).
+    - How: fields are skipped — they are AI instructions, not user claims.
+    - Preferences entries whose How: field is < 15 chars are rejected (quality gate).
+    - Sends the grounding-relevant claim for each entry to the LLM.
+    - Returns full entries (including How:, pk tags, new: tags) for GROUNDED ones.
+    - Preserves section headers in output so _merge_soul_entry can parse it.
+
+    Backward compatible: if observations has no ## section headers, falls back
+    to the original line-by-line behaviour.
+    """
     if not observations.strip() or not user_turns.strip():
         return ""
 
@@ -180,6 +191,132 @@ def grounding_check(observations: str, user_turns: str) -> str:
         print(f"Grounding: user_turns truncated from {len(user_turns)} to 20000 (LLM fallback)", file=sys.stderr)
         user_turns = user_turns[:20000]
 
+    # ── Backward-compat: old flat-bullet format (no ## section headers) ──
+    if not re.search(r"^## ", observations, re.M):
+        return _grounding_check_legacy(observations, user_turns)
+
+    # ── Structured format: entry-aware grounding ──────────────────────────
+    _PK_RE = re.compile(r'\s*<!--\s*pk:\s*[\w-]+\s*-->')
+    SECTION_ORDER = ("Identity", "Preferences", "Patterns", "Context")
+
+    def _extract_claim(section_name: str, entry: str) -> str | None:
+        """Return grounding claim for entry, or None if it fails quality gate."""
+        entry_lines = entry.split("\n")
+
+        # Quality gate: Preferences.How: must be >= 15 chars
+        if section_name == "Preferences":
+            how_line = next(
+                (l for l in entry_lines if re.match(r'\s+How:', l)), None
+            )
+            if how_line:
+                how_text = re.sub(r'^\s*How:\s*', "", how_line).strip()
+                if len(how_text) < 15:
+                    return None  # too vague — quality gate rejects
+
+        # Build claim: strip How: lines and pk tags
+        claim_lines = []
+        for line in entry_lines:
+            if re.match(r'\s+How:', line):
+                continue  # How: is an AI instruction, not a user claim
+            clean = _PK_RE.sub("", line)
+            claim_lines.append(clean)
+        return "\n".join(claim_lines).strip()
+
+    # Collect (section, entry, claim) triples — entries with None claims are
+    # already rejected by the quality gate and excluded from grounding call.
+    triples: list[tuple[str, str, str]] = []  # (section, full_entry, claim)
+    gated_out: list[tuple[str, str]] = []     # (section, full_entry) quality-gate rejects
+
+    parsed = _parse_soul_sections(observations)
+    for section in SECTION_ORDER:
+        for entry in parsed.get(section, []):
+            claim = _extract_claim(section, entry)
+            if claim is None:
+                how_preview = entry.split("\n")[0][:60]
+                print(f"Grounding: How: quality gate rejected: {how_preview}", file=sys.stderr)
+                gated_out.append((section, entry))
+            else:
+                triples.append((section, entry, claim))
+
+    if not triples:
+        return ""
+
+    # Build numbered bullet list of claims for the LLM
+    numbered_claims = "\n".join(
+        f"{i + 1}. {claim}" for i, (_, _, claim) in enumerate(triples)
+    )
+    prompt = f"## 观察\n\n{numbered_claims}\n\n## 用户原始消息\n\n{user_turns}"
+    verdict = call_engine(prompt, GROUNDING_SYSTEM)
+    if not verdict:
+        print("Grounding: LLM returned empty response (possible API refusal)", file=sys.stderr)
+        return ""
+
+    # Parse verdicts — LLM echoes bullets; match back by index or text proximity.
+    # Strategy: build an ordered list of (index, is_grounded) from verdict lines.
+    # Index is inferred by matching the bullet text against the numbered claims.
+    grounded_indices: set[int] = set()
+    claim_texts = [claim for _, _, claim in triples]
+
+    for vline in verdict.strip().splitlines():
+        vline = vline.strip()
+        if not vline:
+            continue
+        if vline.startswith("GROUNDED:"):
+            raw_bullet = vline[len("GROUNDED:"):].strip().lstrip("- ").lstrip()
+            # Try numeric prefix first: "GROUNDED: 3. ..." → index 2
+            num_m = re.match(r'^(\d+)[.)\s]', raw_bullet)
+            if num_m:
+                idx = int(num_m.group(1)) - 1
+                if 0 <= idx < len(triples):
+                    grounded_indices.add(idx)
+                    continue
+            # Fallback: substring match against claim texts
+            for idx, claim in enumerate(claim_texts):
+                first_claim_line = claim.split("\n")[0]
+                clean_bullet = _PK_RE.sub("", raw_bullet).strip()
+                if clean_bullet in first_claim_line or first_claim_line[:40] in clean_bullet:
+                    grounded_indices.add(idx)
+                    break
+            else:
+                # Last resort: bigram Jaccard similarity ≥ 0.45
+                bullet_tokens = _tokenize_bigram(raw_bullet)
+                best_score, best_idx = 0.0, -1
+                for idx, claim in enumerate(claim_texts):
+                    score = _jaccard(bullet_tokens, _tokenize_bigram(claim))
+                    if score > best_score:
+                        best_score, best_idx = score, idx
+                if best_score >= 0.45 and best_idx >= 0:
+                    grounded_indices.add(best_idx)
+        elif vline.startswith("FABRICATED:"):
+            print(f"Grounding rejected: {vline[:100]}", file=sys.stderr)
+        else:
+            print(f"Grounding: unparseable judge line: {vline[:80]}", file=sys.stderr)
+
+    if not grounded_indices:
+        return ""
+
+    # Reassemble output: section headers + GROUNDED entries only
+    output_sections: dict[str, list[str]] = {s: [] for s in SECTION_ORDER}
+    for idx, (section, full_entry, _) in enumerate(triples):
+        if idx in grounded_indices:
+            output_sections[section].append(full_entry)
+
+    parts: list[str] = []
+    for section in SECTION_ORDER:
+        entries = output_sections[section]
+        if not entries:
+            continue
+        parts.append(f"## {section}")
+        for entry in entries:
+            parts.append(entry)
+        parts.append("")  # blank line between sections
+
+    return "\n".join(parts).strip()
+
+
+def _grounding_check_legacy(observations: str, user_turns: str) -> str:
+    """Original line-by-line grounding for old flat-bullet SOUL format.
+    Called by grounding_check() when no ## section headers are detected."""
     # Strip pk tags before sending to grounding LLM — LLMs unreliably preserve HTML comments
     pk_re = re.compile(r'\s*<!--\s*pk:\s*[\w-]+\s*-->')
     pk_map = {}  # normalized bullet text → pk tag
@@ -208,7 +345,6 @@ def grounding_check(observations: str, user_turns: str) -> str:
         if line.startswith("GROUNDED:"):
             bullet = line[len("GROUNDED:"):].strip()
             if bullet:
-                # Normalize: ensure single leading "- ", preserve content after it
                 bullet = bullet.lstrip("-").lstrip()
                 kept.append(f"- {bullet}")
         elif line.startswith("FABRICATED:"):
