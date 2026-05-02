@@ -27,12 +27,14 @@ graph LR
 每天 cron 自动执行完整链路：
 
 ```
-harvest → report → push → soul → lessons → distill → gene-health → sync-memory
-   │         │       │      │        │         │          │            │
-   │         │       │      │        │         │          │            └─ 推送到知识仓库
-   │         │       │      │        │         │          └─ Gene 衰减追踪
-   │         │       │      │        │         └─ 蒸馏规则 → MEMORY.md
-   │         │       │      │        └─ 提取教训 → LESSONS.md
+harvest → report → push → soul → dream → lessons → distill → gene-health → daily → sync-memory
+   │         │       │      │       │        │         │          │           │        │
+   │         │       │      │       │        │         │          │           │        └─ 推送到知识仓库
+   │         │       │      │       │        │         │          │           └─ 每日健康报告
+   │         │       │      │       │        │         │          └─ Gene 衰减追踪
+   │         │       │      │       │        │         └─ 蒸馏规则 → MEMORY.md
+   │         │       │      │       │        └─ 提取教训 → LESSONS.md
+   │         │       │      │       └─ 整合去重 SOUL.md
    │         │       │      └─ 提取观察 → SOUL.md
    │         │       └─ 推送到企微群
    │         └─ 生成日报
@@ -43,11 +45,12 @@ harvest → report → push → soul → lessons → distill → gene-health →
 |--------|--------|
 | `report` | 日报：精确工具统计 + LLM 摘要 |
 | `push` | 推送日报到企业微信群 |
-| `soul` | 全量上下文（200K）行为观察提取，quality gate + grounding check 双重门控 |
-| `lessons` | 经验教训提取：坑/因/法，只留跨项目可迁移的错题本 |
+| `soul` | 全量上下文（200K）行为观察提取，4 类分类（Identity/Preferences/Patterns/Context），Preferences 强制 Why+How |
+| `dream` | SOUL.md 机械整合：Jaccard 去重 + pk 合并 + 条目数限制裁剪（不调 LLM） |
+| `lessons` | 经验教训提取：5 类（trap/toolchain/arch/correction/method），只留跨项目可迁移的错题本 |
 | `distill` | 蒸馏 SOUL + LESSONS → MEMORY.md 行为规则（MUST/MUST_NOT/PREFER/CONTEXT） |
 | `gene-health` | Gene 新鲜度衰减模型，registry 重建，晋升建议 |
-| `daily` | 每日健康报告：知识摘要、重复检测、规则新鲜度、链路健康（纯机械，不调 LLM） |
+| `daily` | 每日健康报告：知识摘要、重复检测、规则新鲜度、链路健康、可操作建议（纯机械，不调 LLM） |
 | `sync-memory` | 提交并推送到远端知识仓库，供 git-library MCP 检索分发 |
 
 ## 自我迭代是怎么发生的
@@ -100,8 +103,14 @@ python3 ai_log_converter.py --slop input.jsonl output.md
 ## 快速开始
 
 ```bash
+# 新机器一键部署
+make setup
+
 # 全量采集 + 蒸馏全链路（日常 cron 做的事）
-make harvest && make report && make push && make soul && make lessons && make distill && make gene-health && make daily && make sync-memory
+make harvest && make report && make push && make soul && make dream && make lessons && make distill && make gene-health && make daily && make sync-memory
+
+# 历史数据回填（选 top 8 天重跑 soul 提取）
+make backfill-soul && make dream
 
 # 安装 cron（每天 08:47 自动执行）
 make install-cron
@@ -113,7 +122,7 @@ scripts/extract-gene.sh plan-before-act
 ## 架构
 
 ```
-ai_report.py          流水线：7 个子命令，数据流转逻辑
+ai_report.py          流水线：9 个子命令，数据流转逻辑
 ai_engine.py          引擎：codex exec (128K) → call_llm fallback (auto-batch)
 ai_prompts.py         数据：所有 prompt 常量，纯文本无逻辑
 ai_log_converter.py   转换器：4 种格式 mapper，流式处理
