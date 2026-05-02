@@ -1837,9 +1837,9 @@ def cmd_daily(args):
     soul_total = soul_unabsorbed = soul_today = 0
     if soul_path.exists():
         sc = soul_path.read_text(encoding="utf-8")
-        soul_total = len(re.findall(r'^### \d{4}-\d{2}-\d{2}$', sc, re.M))
-        soul_unabsorbed = sc.count("absorbed: false")
-        soul_today = len(re.findall(rf'^### {target_date}$', sc, re.M))
+        soul_total = len(re.findall(r'^- ', sc, re.M))  # count bullet entries
+        soul_unabsorbed = sc.count("<!-- new:")  # new entries not yet absorbed
+        soul_today = len(re.findall(rf'<!-- new: {target_date} -->', sc))
     # LESSONS.md
     les_total = les_absorbed = les_unabsorbed = les_review = 0
     if lessons_path.exists():
@@ -1978,7 +1978,7 @@ def cmd_daily(args):
         day = target_date - timedelta(days=d)
         n_sessions = len(find_sessions(logs_dir, day))
         has_report = (reports_dir / f"{day}.md").exists()
-        has_soul = f"### {day}" in soul_content
+        has_soul = f"<!-- new: {day} -->" in soul_content
         n_lessons = len(re.findall(rf'>\s*{day}\s*\|', lessons_content))
         s7.append(f"| {day} | {n_sessions} | {'✓' if has_report else '—'} | {'✓' if has_soul else '—'} | +{n_lessons} |")
     sections.append("\n".join(s7))
@@ -1991,6 +1991,57 @@ def cmd_daily(args):
     else:
         s8.append("无待办 — 一切正常")
     sections.append("\n".join(s8))
+
+
+    # --- Section 9: 可操作建议 ---
+    s9 = ["## 9. 可操作建议\n"]
+    recommendations = []
+
+    # 9a: Unabsorbed Preferences in SOUL
+    if soul_path.exists():
+        soul_content = soul_path.read_text(encoding="utf-8")
+        # Count entries with <!-- new: --> but not <!-- absorbed: -->
+        new_entries = len(re.findall(r'<!-- new: \d{4}-\d{2}-\d{2} -->', soul_content))
+        absorbed_entries = len(re.findall(r'<!-- absorbed: \d{4}-\d{2}-\d{2} -->', soul_content))
+        unabsorbed = new_entries - absorbed_entries
+        if unabsorbed > 0:
+            recommendations.append(
+                f"SOUL 有 {unabsorbed} 条未吸收条目，建议 `make distill` 转化为 MEMORY 规则"
+            )
+
+    # 9b: Pattern with >=3 days but no Gene
+    if genes_dir.is_dir():
+        for pk, cnt in pattern_counts.items():
+            if cnt >= 3 and not (genes_dir / pk).exists():
+                recommendations.append(f"pk `{pk}` 出现 {cnt} 天，建议提取为 Gene")
+
+    # 9c: Identity section too sparse
+    if soul_path.exists():
+        identity_section = re.search(r'## Identity\n(.*?)(?=\n## |\Z)', soul_content, re.S)
+        identity_count = len(re.findall(r'^- ', identity_section.group(1), re.M)) if identity_section else 0
+        if identity_count < 2:
+            recommendations.append(
+                "SOUL Identity 不足 2 条——AI 不知道你是谁，"
+                "建议下次会话后 `make soul` 补充身份画像"
+            )
+
+    # 9d: Preferences without How
+    if soul_path.exists():
+        prefs_section = re.search(r'## Preferences\n(.*?)(?=\n## |\Z)', soul_content, re.S)
+        if prefs_section:
+            pref_entries = re.findall(r'^- (?:PREFER|REJECT).*', prefs_section.group(1), re.M)
+            prefs_no_how = sum(1 for _ in pref_entries) - soul_content.count("How:")
+            if prefs_no_how > 0:
+                recommendations.append(
+                    f"{prefs_no_how} 条 Preferences 缺 How（不可操作），建议补充或 `make dream` 整合"
+                )
+
+    if recommendations:
+        for r in recommendations:
+            s9.append(f"- {r}")
+    else:
+        s9.append("无建议 — 系统状态健康")
+    sections.append("\n".join(s9))
 
     # Write report
     header = f"# Daily Health Report — {target_date}\n"

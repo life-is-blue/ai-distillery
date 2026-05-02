@@ -5,6 +5,7 @@ Tests call production code directly — no logic duplication.
 
 import json
 import os
+import re
 import tempfile
 import unittest
 from datetime import date
@@ -25,6 +26,9 @@ from ai_report import (
     _parse_all_lesson_pits,
     _count_memory_rules,
     extract_pattern_counts,
+    _merge_soul_entry,
+    _parse_soul_sections,
+    extract_unabsorbed_soul,
 )
 from ai_prompts import MEMORY_SKELETON
 
@@ -353,6 +357,210 @@ class TestExtractPatternCounts(unittest.TestCase):
             counts = extract_pattern_counts(Path(path))
             self.assertEqual(counts["plan-before-act"], 2)
             self.assertEqual(counts["tight-loop"], 1)
+        finally:
+            os.unlink(path)
+
+
+
+
+class TestMergeSoulEntry(unittest.TestCase):
+    """Tests for _merge_soul_entry()."""
+
+    def _skeleton(self) -> str:
+        return (
+            "# SOUL.md\n\n"
+            "> Last updated: 2026-05-02\n\n"
+            "---\n\n"
+            "## Identity\n\n"
+            "## Preferences\n\n"
+            "## Patterns\n\n"
+            "## Context\n"
+        )
+
+    def test_identity_dedup_jaccard(self):
+        """Similar identity entries (Jaccard > 0.5) are skipped."""
+        soul = self._skeleton() + "- I prefer clean code\n"
+        # Very similar entry: should be deduped
+        new_obs = "## Identity\n\n- I prefer clean code style\n"
+        result = _merge_soul_entry(soul, new_obs, "2026-05-02")
+        # Only 1 identity entry should remain (new one deduped as too similar)
+        identity_m = re.search(r"## Identity\n(.*?)(?=\n## |\Z)", result, re.S)
+        entries = [l for l in identity_m.group(1).splitlines() if l.strip().startswith("-")]
+        self.assertEqual(len(entries), 1)
+
+    def test_preferences_dedup_by_key(self):
+        """Same PREFER key updates the existing entry in place."""
+        soul = (
+            "# SOUL.md\n\n"
+            "## Identity\n\n"
+            "## Preferences\n\n"
+            "- PREFER streaming over batch\n\n"
+            "## Patterns\n\n"
+            "## Context\n"
+        )
+        new_obs = "## Preferences\n\n- PREFER streaming over batch, faster feedback\n"
+        result = _merge_soul_entry(soul, new_obs, "2026-05-02")
+        # Should still be 1 Preferences entry (updated)
+        pref_m = re.search(r"## Preferences\n(.*?)(?=\n## |\Z)", result, re.S)
+        entries = [l for l in pref_m.group(1).splitlines() if l.strip().startswith("-")]
+        self.assertEqual(len(entries), 1)
+        # The entry should contain the new text
+        self.assertIn("faster feedback", result)
+
+    def test_preferences_new_appends(self):
+        """Different PREFER key appends a new entry."""
+        soul = (
+            "# SOUL.md\n\n"
+            "## Identity\n\n"
+            "## Preferences\n\n"
+            "- PREFER streaming over batch\n\n"
+            "## Patterns\n\n"
+            "## Context\n"
+        )
+        new_obs = "## Preferences\n\n- PREFER small commits\n"
+        result = _merge_soul_entry(soul, new_obs, "2026-05-02")
+        pref_m = re.search(r"## Preferences\n(.*?)(?=\n## |\Z)", result, re.S)
+        entries = [l for l in pref_m.group(1).splitlines() if l.strip().startswith("-")]
+        self.assertEqual(len(entries), 2)
+
+    def test_patterns_dedup_by_pk(self):
+        """Same pk tag replaces existing wording."""
+        soul = (
+            "# SOUL.md\n\n"
+            "## Identity\n\n"
+            "## Preferences\n\n"
+            "## Patterns\n\n"
+            "- Old wording <!-- pk: plan-before-act -->\n\n"
+            "## Context\n"
+        )
+        new_obs = "## Patterns\n\n- New wording <!-- pk: plan-before-act -->\n"
+        result = _merge_soul_entry(soul, new_obs, "2026-05-02")
+        self.assertNotIn("Old wording", result)
+        self.assertIn("New wording", result)
+        pat_m = re.search(r"## Patterns\n(.*?)(?=\n## |\Z)", result, re.S)
+        entries = [l for l in pat_m.group(1).splitlines() if l.strip().startswith("-")]
+        self.assertEqual(len(entries), 1)
+
+    def test_context_dedup_by_prefix(self):
+        """Same context fact (with since-date variation) deduplicates correctly."""
+        soul = (
+            "# SOUL.md\n\n"
+            "## Identity\n\n"
+            "## Preferences\n\n"
+            "## Patterns\n\n"
+            "## Context\n\n"
+            "- Works at Acme Corp (since 2020) <!-- new: 2026-01-01 -->\n"
+        )
+        # New entry: same fact, different since-date → should replace existing
+        new_obs = "## Context\n\n- Works at Acme Corp (since 2024)\n"
+        result = _merge_soul_entry(soul, new_obs, "2026-05-02")
+        ctx_m = re.search(r"## Context\n(.*?)(?=\n## |\Z)", result, re.S)
+        entries = [l for l in ctx_m.group(1).splitlines() if l.strip().startswith("-")]
+        self.assertEqual(len(entries), 1)
+
+    def test_empty_soul_gets_skeleton(self):
+        """Empty soul_content gets sections created automatically."""
+        soul = "# SOUL.md\n\n"  # no sections at all
+        new_obs = "## Identity\n\n- I am a backend engineer\n"
+        result = _merge_soul_entry(soul, new_obs, "2026-05-02")
+        self.assertIn("## Identity", result)
+        self.assertIn("backend engineer", result)
+
+
+class TestParseSoulSections(unittest.TestCase):
+    """Tests for _parse_soul_sections()."""
+
+    def test_parses_four_sections(self):
+        content = (
+            "# SOUL.md\n\n"
+            "## Identity\n\n"
+            "- I am a developer\n\n"
+            "## Preferences\n\n"
+            "- PREFER Python over Java\n"
+            "  Why: ecosystem\n"
+            "  How: default to Python\n\n"
+            "## Patterns\n\n"
+            "- Always plan <!-- pk: plan-before-act -->\n\n"
+            "## Context\n\n"
+            "- Senior engineer at startup\n"
+        )
+        sections = _parse_soul_sections(content)
+        self.assertEqual(len(sections["Identity"]), 1)
+        self.assertEqual(len(sections["Preferences"]), 1)
+        self.assertEqual(len(sections["Patterns"]), 1)
+        self.assertEqual(len(sections["Context"]), 1)
+
+    def test_empty_sections(self):
+        content = (
+            "## Identity\n\n"
+            "## Preferences\n\n"
+            "## Patterns\n\n"
+            "## Context\n"
+        )
+        sections = _parse_soul_sections(content)
+        self.assertEqual(sections["Identity"], [])
+        self.assertEqual(sections["Preferences"], [])
+        self.assertEqual(sections["Patterns"], [])
+        self.assertEqual(sections["Context"], [])
+
+    def test_multiline_preferences(self):
+        """A multi-line Preferences entry (Why/How) stays as one entry."""
+        content = (
+            "## Preferences\n\n"
+            "- PREFER streaming over batch\n"
+            "  Why: faster feedback\n"
+            "  How: always stream\n\n"
+            "## Patterns\n"
+        )
+        sections = _parse_soul_sections(content)
+        self.assertEqual(len(sections["Preferences"]), 1)
+        self.assertIn("Why: faster feedback", sections["Preferences"][0])
+
+
+class TestExtractUnabsorbedSoul(unittest.TestCase):
+    """Tests for extract_unabsorbed_soul()."""
+
+    def test_finds_new_entries(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+            f.write(
+                "## Identity\n\n"
+                "- I code in Python <!-- new: 2026-05-02 -->\n\n"
+                "## Preferences\n\n"
+                "## Patterns\n\n"
+                "## Context\n"
+            )
+            path = f.name
+        try:
+            result = extract_unabsorbed_soul(Path(path))
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0][0], "Identity")
+            self.assertIn("Python", result[0][1])
+        finally:
+            os.unlink(path)
+
+    def test_skips_absorbed(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+            f.write(
+                "## Identity\n\n"
+                "- I code in Python <!-- absorbed: 2026-05-01 -->\n\n"
+                "## Preferences\n\n"
+                "## Patterns\n\n"
+                "## Context\n"
+            )
+            path = f.name
+        try:
+            result = extract_unabsorbed_soul(Path(path))
+            self.assertEqual(len(result), 0)
+        finally:
+            os.unlink(path)
+
+    def test_empty_file(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+            f.write("")
+            path = f.name
+        try:
+            result = extract_unabsorbed_soul(Path(path))
+            self.assertEqual(result, [])
         finally:
             os.unlink(path)
 
