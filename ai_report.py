@@ -8,6 +8,7 @@ Subcommands:
   soul         Full-context observation extraction → SOUL.md
   lessons      Extract lessons learned → LESSONS.md
   distill      Distill SOUL + LESSONS → MEMORY.md rules
+  dream        Consolidate SOUL.md: merge duplicates, prune stale entries
   gene-health  Compute Gene freshness, rebuild registry
   sync-memory  Commit and push ai-logs/ to remote
 
@@ -479,14 +480,8 @@ def cmd_soul(args):
     # Legacy format cleanup: remove "Sessions processed: N" if present
     content = re.sub(r"> Sessions processed: \d+\n", "", content)
 
-    # Dedup: replace entry_date's entry if it exists, otherwise append
-    date_header = f"\n### {entry_date}\n"
-    entry = f"{date_header}<!-- absorbed: false -->\n\n{observations}\n"
-    if date_header in content:
-        segments = re.split(r'(?=\n### \d{4}-\d{2}-\d{2}\n)', content)
-        content = "".join(s for s in segments if not s.startswith(date_header)) + entry
-    else:
-        content += entry
+    # Merge new observations into 4-section structure
+    content = _merge_soul_entry(content, observations, str(entry_date))
 
     soul_path.write_text(content, encoding="utf-8")
     print(f"OK {soul_path} ({entry_date}, +{len(sessions)} sessions)", file=sys.stderr)
@@ -524,7 +519,7 @@ def extract_pattern_counts(soul_path: Path, lessons_path: Path | None = None) ->
     pk_dates: dict[str, set[str]] = {}
     pk_re = re.compile(r'<!--\s*pk:\s*([\w-]+)\s*-->')
 
-    # --- SOUL.md: date sections with pk-tagged bullets ---
+    # --- SOUL.md: date sections with pk-tagged bullets (legacy format) ---
     if soul_path.exists():
         content = soul_path.read_text(encoding="utf-8")
         entries = re.split(r'(?=\n### \d{4}-\d{2}-\d{2}\n)', content)
@@ -536,6 +531,15 @@ def extract_pattern_counts(soul_path: Path, lessons_path: Path | None = None) ->
             for pk_match in pk_re.finditer(entry):
                 key = pk_match.group(1)
                 pk_dates.setdefault(key, set()).add(date_str)
+        # --- SOUL.md: new 4-section format with inline <!-- new: DATE --> tags ---
+        for line in content.splitlines():
+            pk_m = re.search(r'<!--\s*pk:\s*([\w-]+)\s*-->', line)
+            if not pk_m:
+                continue
+            date_tag = (re.search(r'<!--\s*new:\s*(\d{4}-\d{2}-\d{2})\s*-->', line)
+                        or re.search(r'<!--\s*absorbed:\s*(\d{4}-\d{2}-\d{2})\s*-->', line))
+            if date_tag:
+                pk_dates.setdefault(pk_m.group(1), set()).add(date_tag.group(1))
 
     # --- LESSONS.md: each entry has `> YYYY-MM-DD | pk: xxx` ---
     if lessons_path and lessons_path.exists():
@@ -869,7 +873,7 @@ def cmd_distill(args):
     review_agent_entries(lessons_path)
 
     # Phase 1: extract unabsorbed from both sources
-    unabsorbed_soul = extract_unabsorbed(soul_path)
+    unabsorbed_soul = extract_unabsorbed_soul(soul_path)
     unabsorbed_lessons = extract_unabsorbed_lessons(lessons_path)
     all_unabsorbed = unabsorbed_soul + unabsorbed_lessons
 
@@ -903,7 +907,7 @@ def cmd_distill(args):
     obs_parts = []
     if unabsorbed_soul:
         obs_parts.append("### 行为观察（来自 SOUL.md）\n\n" +
-                         "\n\n".join(f"#### {d}\n{t}" for d, t in unabsorbed_soul))
+                         "\n\n".join(f"#### [{section}]\n{entry}" for section, entry in unabsorbed_soul))
     if unabsorbed_lessons:
         obs_parts.append("### 经验教训（来自 LESSONS.md）\n\n" +
                          "\n\n".join(f"#### {d}\n{t}" for d, t in unabsorbed_lessons))
@@ -921,8 +925,8 @@ def cmd_distill(args):
         memory_path.write_text(new_memory, encoding="utf-8")
 
     # Phase 5: mark absorbed + prune old
-    mark_absorbed(soul_path, [d for d, _ in unabsorbed_soul])
-    prune_old(soul_path, keep_days=30)
+    _mark_absorbed_soul_entries(soul_path, [t for _, t in unabsorbed_soul])
+    prune_old(soul_path, keep_days=30)  # no-op for new format, safe for old
     _mark_lessons_absorbed(lessons_path, unabsorbed_lessons)
     prune_old_lessons(lessons_path, keep_days=90)
 
@@ -1166,6 +1170,433 @@ def _jaccard(a: set, b: set) -> float:
     if not a or not b:
         return 0.0
     return len(a & b) / len(a | b)
+
+
+# ── SOUL 4-section helpers ─────────────────────────────────────────────────
+
+def _parse_section_entries(section_name: str, body: str) -> list[str]:
+    """Extract individual entries from a section body string.
+
+    For Preferences, each entry spans the PREFER/REJECT line plus indented
+    Why:/How: continuation lines.  All other sections are single-line bullets.
+    """
+    entries: list[str] = []
+    current_lines: list[str] = []
+
+    for line in body.splitlines():
+        if line.startswith("- "):
+            if current_lines:
+                entries.append("\n".join(current_lines))
+            current_lines = [line]
+        elif current_lines and section_name == "Preferences" and (
+            line.startswith("  ") or line.startswith("\t")
+        ):
+            # indented continuation for multi-line Preferences entry
+            current_lines.append(line)
+        elif line.strip() and current_lines:
+            # non-bullet non-empty non-continuation → end current entry
+            entries.append("\n".join(current_lines))
+            current_lines = []
+        # blank lines and section metadata lines are skipped
+
+    if current_lines:
+        entries.append("\n".join(current_lines))
+
+    return entries
+
+
+def _parse_soul_sections(content: str) -> dict[str, list[str]]:
+    """Parse SOUL.md content into {section_name: [entry_str, ...]} dict.
+
+    Handles the 4 canonical sections: Identity, Preferences, Patterns, Context.
+    Unknown sections and header content are ignored.
+    """
+    result: dict[str, list[str]] = {
+        "Identity": [], "Preferences": [], "Patterns": [], "Context": []
+    }
+    parts = re.split(r"(?=^## )", content, flags=re.M)
+    for part in parts:
+        m = re.match(r"^## (Identity|Preferences|Patterns|Context)\s*\n", part)
+        if not m:
+            continue
+        section_name = m.group(1)
+        body = part[m.end():]
+        result[section_name] = _parse_section_entries(section_name, body)
+    return result
+
+
+def _pref_key(first_line: str) -> str:
+    """Dedup key for a Preferences entry: text after PREFER/REJECT up to
+    first comma (ASCII or CJK), lowercased, backticks/asterisks removed."""
+    # strip HTML comments
+    line = re.sub(r"\s*<!--.*?-->", "", first_line, flags=re.DOTALL).strip()
+    m = re.match(r"^-\s*(?:PREFER|REJECT)\s+(.+)", line)
+    if not m:
+        return line.lower().replace("`", "")[:50]
+    text = m.group(1)
+    # stop at first ASCII or CJK comma
+    text = re.split(r"[,，]", text, maxsplit=1)[0]
+    return text.strip().lower().replace("`", "").replace("*", "")[:50]
+
+
+def _update_soul_section(
+    soul_content: str,
+    section_name: str,
+    to_replace: dict[str, str],
+    to_add: list[str],
+) -> str:
+    """Apply replacements and additions to a named section in soul_content.
+
+    Replacements are done by exact-string substitution on the full content.
+    New entries are appended before the next ## section header (or EOF).
+    """
+    # Apply replacements first (entries are unique strings within the file)
+    for old_entry, new_entry in to_replace.items():
+        # Try exact match first; fall back to first-line match
+        if old_entry in soul_content:
+            soul_content = soul_content.replace(old_entry, new_entry, 1)
+        else:
+            old_first = old_entry.split("\n")[0]
+            new_first = new_entry.split("\n")[0]
+            if old_first in soul_content:
+                soul_content = soul_content.replace(old_first, new_first, 1)
+
+    if not to_add:
+        return soul_content
+
+    # Locate section header
+    header_re = re.compile(rf"^## {re.escape(section_name)}\s*$", re.M)
+    m_hdr = header_re.search(soul_content)
+    if not m_hdr:
+        return soul_content
+
+    body_start = m_hdr.end()
+
+    # Locate next ## section (to know where the body ends)
+    next_re = re.compile(r"^## ", re.M)
+    m_next = next_re.search(soul_content, body_start)
+    insert_pos = m_next.start() if m_next else len(soul_content)
+
+    block = ""
+    for entry in to_add:
+        block += entry.rstrip("\n") + "\n"
+
+    before = soul_content[:insert_pos].rstrip("\n") + "\n"
+    after = soul_content[insert_pos:]
+    return before + block + after
+
+
+def _merge_soul_entry(
+    soul_content: str, new_observations: str, entry_date: str
+) -> str:
+    """Incrementally merge LLM observations (4-section format) into soul_content.
+
+    For each of the 4 sections, new entries are tagged with <!-- new: date -->
+    and deduplicated against existing entries using section-appropriate logic:
+      Identity   — Jaccard bigram similarity > 0.5 → skip duplicate
+      Preferences — dedup key (text after PREFER/REJECT up to comma) → replace or add
+      Patterns   — pk tag value → replace or add
+      Context    — first 30 chars normalized → replace (update since-date) or add
+    """
+    new_sections = _parse_soul_sections(new_observations)
+
+    for section_name in ("Identity", "Preferences", "Patterns", "Context"):
+        new_entries = new_sections.get(section_name, [])
+        if not new_entries:
+            continue
+
+        # Ensure section exists in soul_content (safety net for migration)
+        if f"## {section_name}" not in soul_content:
+            # Append section before end of file
+            soul_content = soul_content.rstrip("\n") + f"\n\n## {section_name}\n"
+
+        existing_sections = _parse_soul_sections(soul_content)
+        existing = existing_sections.get(section_name, [])
+
+        to_add: list[str] = []
+        to_replace: dict[str, str] = {}
+
+        for new_entry in new_entries:
+            # Tag first line with <!-- new: entry_date --> (idempotent)
+            lines = new_entry.split("\n")
+            first_line = lines[0]
+            if "<!-- new:" not in first_line and "<!-- absorbed:" not in first_line:
+                lines[0] = first_line + f" <!-- new: {entry_date} -->"
+            tagged_entry = "\n".join(lines)
+
+            # ── Identity: Jaccard similarity ──────────────────────────────
+            if section_name == "Identity":
+                tokens_new = _tokenize_bigram(new_entry)
+                is_dup = any(_jaccard(tokens_new, _tokenize_bigram(ex)) > 0.5
+                             for ex in existing)
+                if not is_dup:
+                    to_add.append(tagged_entry)
+
+            # ── Preferences: dedup by PREFER/REJECT key ───────────────────
+            elif section_name == "Preferences":
+                new_key = _pref_key(lines[0])
+                matched = next(
+                    (ex for ex in existing
+                     if _pref_key(ex.split("\n")[0]) == new_key),
+                    None,
+                )
+                if matched:
+                    to_replace[matched] = tagged_entry
+                else:
+                    to_add.append(tagged_entry)
+
+            # ── Patterns: dedup by <!-- pk: key --> ───────────────────────
+            elif section_name == "Patterns":
+                pk_m = re.search(r"<!--\s*pk:\s*([\w-]+)\s*-->", new_entry)
+                if not pk_m:
+                    to_add.append(tagged_entry)
+                    continue
+                pk = pk_m.group(1)
+                matched = next(
+                    (ex for ex in existing
+                     if re.search(r"<!--\s*pk:\s*" + re.escape(pk) + r"\s*-->", ex)),
+                    None,
+                )
+                if matched:
+                    to_replace[matched] = tagged_entry
+                else:
+                    to_add.append(tagged_entry)
+
+            # ── Context: dedup by normalized first-30-chars prefix ────────
+            elif section_name == "Context":
+                def _ctx_key(text: str) -> str:
+                    # strip HTML comments (new:/absorbed: tags) before keying
+                    clean = re.sub(r"\s*<!--.*?-->", "", text, flags=re.DOTALL)
+                    clean = re.sub(r"\(since[^)]*\)", "", clean).strip().lower()
+                    clean = re.sub(r"\s+", " ", clean)
+                    return clean[:30]
+
+                new_key = _ctx_key(lines[0])
+                matched = next(
+                    (ex for ex in existing if _ctx_key(ex) == new_key),
+                    None,
+                )
+                if matched:
+                    to_replace[matched] = tagged_entry
+                else:
+                    to_add.append(tagged_entry)
+
+        if to_replace or to_add:
+            soul_content = _update_soul_section(
+                soul_content, section_name, to_replace, to_add
+            )
+
+    return soul_content
+
+
+def _rebuild_soul(original_content: str, sections_entries: dict[str, list[str]]) -> str:
+    """Rebuild SOUL.md preserving the header (metadata block) and replacing
+    the 4 sections with the supplied entries."""
+    section_names = ("Identity", "Preferences", "Patterns", "Context")
+    # Everything before the first canonical ## section is the header
+    first_section_re = re.compile(
+        r"^## (?:Identity|Preferences|Patterns|Context)", re.M
+    )
+    m_first = first_section_re.search(original_content)
+    if m_first:
+        line_start = original_content.rfind("\n", 0, m_first.start()) + 1
+        header = original_content[:line_start]
+    else:
+        header = original_content
+
+    result = header.rstrip("\n") + "\n"
+    for name in section_names:
+        result += f"\n## {name}\n\n"
+        for entry in sections_entries.get(name, []):
+            result += entry.rstrip("\n") + "\n"
+    return result
+
+
+# ── Unabsorbed soul entries (new 4-section format) ─────────────────────────
+
+def extract_unabsorbed_soul(soul_path: Path) -> list[tuple[str, str]]:
+    """Parse SOUL.md (new 4-section format), return (section_name, entry_text)
+    for entries tagged with <!-- new: YYYY-MM-DD --> but NOT <!-- absorbed: -->.
+    """
+    if not soul_path.exists():
+        return []
+    content = soul_path.read_text(encoding="utf-8")
+    sections = _parse_soul_sections(content)
+    result: list[tuple[str, str]] = []
+    for section_name, entries in sections.items():
+        for entry in entries:
+            if "<!-- new:" in entry and "<!-- absorbed:" not in entry:
+                result.append((section_name, entry))
+    return result
+
+
+def _mark_absorbed_soul_entries(soul_path: Path, entry_texts: list[str]) -> None:
+    """Change <!-- new: YYYY-MM-DD --> to <!-- absorbed: TODAY --> for each entry.
+
+    Matching is done on the first line of each entry (more robust than full-text
+    match for multi-line Preferences entries).
+    """
+    if not soul_path.exists() or not entry_texts:
+        return
+    today = date.today().isoformat()
+    content = soul_path.read_text(encoding="utf-8")
+    changed = False
+    for entry in entry_texts:
+        first_line = entry.split("\n")[0]
+        if "<!-- new:" not in first_line:
+            continue
+        new_first_line = re.sub(
+            r"\s*<!--\s*new:\s*\d{4}-\d{2}-\d{2}\s*-->",
+            f" <!-- absorbed: {today} -->",
+            first_line,
+        )
+        if new_first_line != first_line and first_line in content:
+            content = content.replace(first_line, new_first_line, 1)
+            changed = True
+    if changed:
+        soul_path.write_text(content, encoding="utf-8")
+
+
+# ── cmd_dream: mechanical 4-phase consolidation ───────────────────────────
+
+def cmd_dream(args):
+    """Consolidate SOUL.md: merge duplicates, prune stale entries, enforce limits."""
+    soul_path = Path(args.soul)
+    if not soul_path.exists():
+        print("SOUL.md not found", file=sys.stderr)
+        return
+
+    content = soul_path.read_text(encoding="utf-8")
+    sections = _parse_soul_sections(content)
+    total = sum(len(v) for v in sections.values())
+
+    if total <= 30:
+        print(f"Dream: {total} entries (≤30), skipping consolidation", file=sys.stderr)
+        return
+
+    # ── Phase 1-2: Orient + Gather (parsing done above) ──────────────────
+
+    # ── Phase 3: Consolidate duplicates within each section ──────────────
+    # Identity: merge similar (Jaccard > 0.5) — keep longer
+    identity = sections["Identity"]
+    merged_identity: list[str] = []
+    for entry in identity:
+        toks = _tokenize_bigram(entry)
+        matched_idx = next(
+            (i for i, ex in enumerate(merged_identity)
+             if _jaccard(toks, _tokenize_bigram(ex)) > 0.5),
+            None,
+        )
+        if matched_idx is None:
+            merged_identity.append(entry)
+        else:
+            # Keep longer entry
+            if len(entry) > len(merged_identity[matched_idx]):
+                merged_identity[matched_idx] = entry
+    sections["Identity"] = merged_identity
+
+    # Preferences: merge same dedup-key — keep latest (the last one seen)
+    prefs: list[str] = []
+    seen_keys: dict[str, int] = {}  # key → index in prefs
+    for entry in sections["Preferences"]:
+        key = _pref_key(entry.split("\n")[0])
+        if key in seen_keys:
+            prefs[seen_keys[key]] = entry  # replace with latest
+        else:
+            seen_keys[key] = len(prefs)
+            prefs.append(entry)
+    sections["Preferences"] = prefs
+
+    # Patterns: merge same pk — keep latest wording
+    patterns: list[str] = []
+    seen_pks: dict[str, int] = {}
+    for entry in sections["Patterns"]:
+        pk_m = re.search(r"<!--\s*pk:\s*([\w-]+)\s*-->", entry)
+        if not pk_m:
+            patterns.append(entry)
+            continue
+        pk = pk_m.group(1)
+        if pk in seen_pks:
+            patterns[seen_pks[pk]] = entry  # keep latest
+        else:
+            seen_pks[pk] = len(patterns)
+            patterns.append(entry)
+    sections["Patterns"] = patterns
+
+    # Context: merge same prefix — keep latest
+    ctx_list: list[str] = []
+
+    def _ctx_key(text: str) -> str:
+        clean = re.sub(r"\s*<!--.*?-->", "", text, flags=re.DOTALL)
+        clean = re.sub(r"\(since[^)]*\)", "", clean).strip().lower()
+        clean = re.sub(r"\s+", " ", clean)
+        return clean[:30]
+
+    seen_ctx: dict[str, int] = {}
+    for entry in sections["Context"]:
+        key = _ctx_key(entry.split("\n")[0])
+        if key in seen_ctx:
+            ctx_list[seen_ctx[key]] = entry
+        else:
+            seen_ctx[key] = len(ctx_list)
+            ctx_list.append(entry)
+    sections["Context"] = ctx_list
+
+    # ── Phase 4: Prune to section limits ─────────────────────────────────
+    LIMITS = {"Identity": 5, "Preferences": 15, "Patterns": 20, "Context": 10}
+
+    def _has_new_tag(entry: str) -> bool:
+        return bool(re.search(r"<!--\s*new:\s*\d{4}-\d{2}-\d{2}\s*-->", entry))
+
+    def _has_absorbed_tag(entry: str) -> bool:
+        return bool(re.search(r"<!--\s*absorbed:", entry))
+
+    # Identity: max 5 — drop absorbed first, then by length (shortest first)
+    if len(sections["Identity"]) > LIMITS["Identity"]:
+        ranked = sorted(
+            sections["Identity"],
+            key=lambda e: (not _has_absorbed_tag(e), len(e)),
+            reverse=True,  # keep: not-absorbed + longest
+        )
+        sections["Identity"] = ranked[: LIMITS["Identity"]]
+
+    # Preferences: max 15 — drop absorbed first
+    if len(sections["Preferences"]) > LIMITS["Preferences"]:
+        active = [e for e in sections["Preferences"] if not _has_absorbed_tag(e)]
+        absorbed = [e for e in sections["Preferences"] if _has_absorbed_tag(e)]
+        # Keep all active, then fill from absorbed
+        combined = active + absorbed
+        sections["Preferences"] = combined[: LIMITS["Preferences"]]
+
+    # Patterns: max 20 — drop by pk-count (lowest first)
+    if len(sections["Patterns"]) > LIMITS["Patterns"]:
+        # Use extract_pattern_counts for rank signal (covers both old + new format)
+        pk_counts = extract_pattern_counts(soul_path)
+
+        def _pk_rank(entry: str) -> int:
+            pk_m = re.search(r"<!--\s*pk:\s*([\w-]+)\s*-->", entry)
+            if not pk_m:
+                return 0
+            return pk_counts.get(pk_m.group(1), 0)
+
+        ranked = sorted(sections["Patterns"], key=_pk_rank, reverse=True)
+        sections["Patterns"] = ranked[: LIMITS["Patterns"]]
+
+    # Context: max 10 — drop absorbed/untagged first
+    if len(sections["Context"]) > LIMITS["Context"]:
+        active = [e for e in sections["Context"] if _has_new_tag(e)]
+        rest = [e for e in sections["Context"] if not _has_new_tag(e)]
+        combined = active + rest
+        sections["Context"] = combined[: LIMITS["Context"]]
+
+    # ── Rebuild + write ───────────────────────────────────────────────────
+    new_content = _rebuild_soul(content, sections)
+    soul_path.write_text(new_content, encoding="utf-8")
+    new_total = sum(len(v) for v in sections.values())
+    print(
+        f"Dream: consolidated {total} → {new_total} entries",
+        file=sys.stderr,
+    )
 
 
 def _parse_all_lesson_pits(lessons_path: Path) -> list[tuple[str, str]]:
@@ -1497,11 +1928,14 @@ def main():
     da.add_argument("--date", type=date.fromisoformat, default=None)
     sm = sub.add_parser("sync-memory")
     sm.add_argument("--logs", default=default_logs)
+    dr = sub.add_parser("dream")
+    dr.add_argument("--soul", default=str(Path(default_logs) / "SOUL.md"))
     args = p.parse_args()
     {"report": cmd_report, "soul": cmd_soul, "push": cmd_push,
      "distill": cmd_distill, "lessons": cmd_lessons,
      "gene-health": cmd_gene_health, "daily": cmd_daily,
-     "sync-memory": cmd_sync_memory}[args.cmd](args)
+     "sync-memory": cmd_sync_memory,
+     "dream": cmd_dream}[args.cmd](args)
 
 
 if __name__ == "__main__":
