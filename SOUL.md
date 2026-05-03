@@ -1,1 +1,1 @@
-ai-logs/SOUL.md
+ai-memory/SOUL.md

@@ -1,6 +1,6 @@
 .PHONY: test clean harvest report push soul dream distill lessons gene-health daily sync-memory install-cron uninstall-cron backfill-soul setup
 
-LOGS     := $(CURDIR)/ai-logs
+LOGS     := $(CURDIR)/ai-memory
 CONVERTER := python3 ai_log_converter.py
 
 export AI_LOGS_DIR := $(LOGS)
@@ -80,7 +80,7 @@ lessons:
 	@python3 ai_report.py lessons --logs $(LOGS) --lessons $(LOGS)/LESSONS.md
 
 gene-health:
-	@python3 ai_report.py gene-health --genes-dir $(LOGS)/.genes
+	@python3 ai_report.py gene-health --genes-dir $(LOGS)/genes
 
 daily:
 	@python3 ai_report.py daily --logs $(LOGS)
@@ -103,7 +103,7 @@ import sys; sys.path.insert(0, '.'); \
 from pathlib import Path; from collections import Counter; \
 from ai_report import find_sessions, session_days; \
 from datetime import date; \
-logs = Path('ai-logs'); \
+logs = Path('ai-memory'); \
 day_counts = Counter(); \
 [day_counts.__setitem__(d, day_counts.get(d, 0) + 1) \
     for p in logs.rglob('*.jsonl') if 'reports' not in p.parts \
@@ -136,15 +136,15 @@ setup:
 		echo "✓ .env exists"; \
 	fi
 	@echo ""
-	@if [ ! -d ai-logs/.git ]; then \
-		echo "WARNING: ai-logs/ is not a git repository."; \
+	@if [ ! -d ai-memory/.git ]; then \
+		echo "WARNING: ai-memory/ is not a git repository."; \
 		echo "  To connect to your ai-memory repo:"; \
-		echo "    git clone <your-ai-memory-repo-url> ai-logs"; \
+		echo "    git clone <your-ai-memory-repo-url> ai-memory"; \
 		echo "  Or to start fresh:"; \
-		echo "    mkdir -p ai-logs && cd ai-logs && git init"; \
+		echo "    mkdir -p ai-memory && cd ai-memory && git init"; \
 		echo ""; \
 	else \
-		echo "✓ ai-logs/ is a git repo"; \
+		echo "✓ ai-memory/ is a git repo"; \
 	fi
 	@echo ""
 	@python3 -c "from ai_report import main; from ai_prompts import SOUL_SYSTEM; print('✓ Imports OK')"

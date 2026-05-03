@@ -15,7 +15,7 @@ graph LR
     C --> D[SOUL.md<br/>行为观察]
     C --> E[LESSONS.md<br/>经验教训]
     D & E --> F[MEMORY.md<br/>行为规则]
-    D & E --> G[.genes/<br/>方法论 Gene]
+    D & E --> G[genes/<br/>方法论 Gene]
     F & G -->|git-library MCP| H[下一次 AI 对话]
     H -->|产生新日志| A
 ```

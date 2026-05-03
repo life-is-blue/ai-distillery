@@ -10,7 +10,7 @@ Subcommands:
   distill      Distill SOUL + LESSONS → MEMORY.md rules
   dream        Consolidate SOUL.md: merge duplicates, prune stale entries
   gene-health  Compute Gene freshness, rebuild registry
-  sync-memory  Commit and push ai-logs/ to remote
+  sync-memory  Commit and push ai-memory/ to remote
 
 Config via .env (auto-loaded):
   LLM_API_KEY           API key (required for report/soul/lessons/distill)
@@ -18,7 +18,7 @@ Config via .env (auto-loaded):
   LLM_MODEL_NAME        Model name (default: gpt-4o-mini)
   LLM_MAX_TOKENS        Max tokens for LLM response (default: 2000)
   WECOM_WEBHOOK_URL     WeCom group robot webhook (optional, for push)
-  AI_LOGS_DIR           Log directory (default: ./ai-logs)
+  AI_LOGS_DIR           Memory directory (default: ./ai-memory)
 """
 import argparse, json, os, re, subprocess, sys
 from datetime import date, datetime, timedelta
@@ -1075,7 +1075,7 @@ def cmd_distill(args):
 
     # Phase 6: Gene auto-extraction — pk≥3 days → create gene.yaml
     if pattern_counts:
-        genes_dir = Path(args.logs) / ".genes"
+        genes_dir = Path(args.logs) / "genes"
         lesson_text_by_pk = {}  # pk → list of entry texts
         if lessons_path.exists():
             lc = lessons_path.read_text(encoding="utf-8")
@@ -1823,7 +1823,7 @@ def cmd_daily(args):
     soul_path = logs_dir / "SOUL.md"
     lessons_path = logs_dir / "LESSONS.md"
     memory_path = logs_dir / "MEMORY.md"
-    genes_dir = logs_dir / ".genes"
+    genes_dir = logs_dir / "genes"
     reports_dir = logs_dir / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     out_path = reports_dir / f"daily-health-{target_date}.md"
@@ -1870,7 +1870,7 @@ def cmd_daily(args):
     s1.append(f"| SOUL.md | {soul_total} 条观察 | 今日 +{soul_today}, unabsorbed {soul_unabsorbed} |")
     s1.append(f"| LESSONS.md | {les_total} 条教训 | absorbed {les_absorbed}, unabsorbed {les_unabsorbed}, needs-review {les_review} |")
     s1.append(f"| MEMORY.md | {mem_total} 条规则 | MUST {mem_counts['MUST']}, MUST_NOT {mem_counts['MUST NOT']}, PREFER {mem_counts['PREFER']}, CONTEXT {mem_counts['CONTEXT']} |")
-    s1.append(f"| .genes/ | {gene_active + gene_stale + gene_degraded} 个 Gene | active {gene_active}, stale {gene_stale}, degraded {gene_degraded} |")
+    s1.append(f"| genes/ | {gene_active + gene_stale + gene_degraded} 个 Gene | active {gene_active}, stale {gene_stale}, degraded {gene_degraded} |")
     sections.append("\n".join(s1))
     if gene_stale:
         todos.append(f"审查 {gene_stale} 个 stale Gene")
@@ -1946,7 +1946,7 @@ def cmd_daily(args):
         except (json.JSONDecodeError, KeyError):
             s5.append("registry.json 解析失败")
     else:
-        s5.append("无 .genes/ 目录")
+        s5.append("无 genes/ 目录")
     sections.append("\n".join(s5))
 
     # --- Section 6: MEMORY.md 规则新鲜度 ---
@@ -2051,11 +2051,11 @@ def cmd_daily(args):
 
 
 def cmd_sync_memory(args):
-    """Commit and push ai-logs/ (which IS the ai-memory repo) to remote.
+    """Commit and push ai-memory/ (which IS the ai-memory repo) to remote.
 
-    ai-logs/ is a git clone of the ai-memory repository. All cmd_* functions
+    ai-memory/ is a git clone of the ai-memory repository. All cmd_* functions
     write directly into it. This command simply stages, commits, and pushes.
-    No file copying — ai-logs/ is the SSOT.
+    No file copying — ai-memory/ is the SSOT.
     """
     logs_dir = Path(args.logs)
     git_dir = logs_dir / ".git"
@@ -2087,7 +2087,7 @@ def cmd_sync_memory(args):
 def main():
     p = argparse.ArgumentParser(description="AI log report & soul builder")
     sub = p.add_subparsers(dest="cmd", required=True)
-    default_logs = os.environ.get("AI_LOGS_DIR", "./ai-logs")
+    default_logs = os.environ.get("AI_LOGS_DIR", "./ai-memory")
     r = sub.add_parser("report")
     r.add_argument("--date", type=date.fromisoformat, default=None)
     r.add_argument("--logs", default=default_logs)
@@ -2109,7 +2109,7 @@ def main():
     le.add_argument("--logs", default=default_logs)
     le.add_argument("--lessons", default=str(Path(default_logs) / "LESSONS.md"))
     gh = sub.add_parser("gene-health")
-    gh.add_argument("--genes-dir", default=str(Path(default_logs) / ".genes"))
+    gh.add_argument("--genes-dir", default=str(Path(default_logs) / "genes"))
     da = sub.add_parser("daily")
     da.add_argument("--logs", default=default_logs)
     da.add_argument("--date", type=date.fromisoformat, default=None)
