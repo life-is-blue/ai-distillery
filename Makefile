@@ -28,7 +28,7 @@ harvest:
 	@for base in $(HOME)/.claude/projects $(HOME)/.claude-internal/projects; do \
 		find "$$base" -maxdepth 3 -name '*.jsonl' -not -path '*/subagents/*' 2>/dev/null | while read src; do \
 			session=$$(basename "$$src" .jsonl); \
-			project=$$(echo "$$src" | sed 's|.*/projects/||' | cut -d/ -f1 | sed 's/^-\?[^-]*-home-[^-]*-project-\?//;s/^-//'); \
+			project=$$(echo "$$src" | sed 's|.*/projects/||' | cut -d/ -f1 | sed 's|^-\?[^-]*-home-[^-]*-project-\?||;s|^Users-[^-]*-Coding-projects-\(active-\)\?||;s|^-||'); \
 			project=$${project:-project}; \
 			tgt=$(LOGS)/claude/$$project/$$session; \
 			[ -f "$$tgt.jsonl" ] && [ "$$tgt.jsonl" -nt "$$src" ] && continue; \
@@ -41,7 +41,7 @@ harvest:
 	@# --- CodeBuddy ---
 	@find $(HOME)/.codebuddy/projects -name '*.jsonl' 2>/dev/null | while read src; do \
 		session=$$(basename "$$src" .jsonl); \
-	project=$$(echo "$$src" | sed 's|.*/projects/||' | cut -d/ -f1 | sed 's/^-\?[^-]*-home-[^-]*-project-\?//;s/^-//'); \
+	project=$$(echo "$$src" | sed 's|.*/projects/||' | cut -d/ -f1 | sed 's|^-\?[^-]*-home-[^-]*-project-\?||;s|^Users-[^-]*-Coding-projects-\(active-\)\?||;s|^-||'); \
 	project=$${project:-project}; \
 	tgt=$(LOGS)/codebuddy/$$project/$$session; \
 		[ -f "$$tgt.jsonl" ] && [ "$$tgt.jsonl" -nt "$$src" ] && continue; \

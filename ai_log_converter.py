@@ -21,6 +21,14 @@ import re
 import sys
 from typing import Generator, Iterable, Optional
 
+def _safe_json(s):
+    """Parse JSON string, return raw string on failure."""
+    try:
+        return json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        return s
+
+
 class Harness:
     def __init__(self, role_filter="all", no_thoughts=False, slop=False):
         self.role_filter = role_filter
@@ -133,7 +141,7 @@ def map_codebuddy(entry: dict) -> Generator[dict, None, None]:
         if res: yield {"role": entry.get("role", "unknown"), "content": res, "meta": {"timestamp": ts}}
     elif etype == "function_call":
         args = entry.get("arguments", "{}")
-        yield {"role": "assistant", "content": [{"type": "tool_call", "name": entry.get("name"), "input": json.loads(args) if isinstance(args, str) else args}], "meta": {"timestamp": ts}}
+        yield {"role": "assistant", "content": [{"type": "tool_call", "name": entry.get("name"), "input": _safe_json(args) if isinstance(args, str) else args}], "meta": {"timestamp": ts}}
     elif etype in ("function_call_result", "function_call_output"):
         output = entry.get("output", {})
         text = output.get("text", "") if isinstance(output, dict) else str(output)
@@ -155,7 +163,7 @@ def map_codex(entry: dict) -> Generator[dict, None, None]:
         if res: yield {"role": role, "content": res, "meta": {"timestamp": ts}}
     elif ptype == "function_call":
         args = p.get("arguments", "{}")
-        yield {"role": "assistant", "content": [{"type": "tool_call", "name": p.get("name"), "input": json.loads(args) if isinstance(args, str) else args}], "meta": {"timestamp": ts}}
+        yield {"role": "assistant", "content": [{"type": "tool_call", "name": p.get("name"), "input": _safe_json(args) if isinstance(args, str) else args}], "meta": {"timestamp": ts}}
     elif ptype == "function_call_output":
         yield {"role": "tool", "content": [{"type": "tool_result", "name": p.get("name"), "content": p.get("output", "")}], "meta": {"timestamp": ts}}
 
