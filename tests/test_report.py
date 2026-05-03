@@ -389,7 +389,7 @@ class TestMergeSoulEntry(unittest.TestCase):
         self.assertEqual(len(entries), 1)
 
     def test_preferences_dedup_by_key(self):
-        """Same PREFER key updates the existing entry in place."""
+        """Same PREFER key appends (dedup is dream's job now)."""
         soul = (
             "# SOUL.md\n\n"
             "## Identity\n\n"
@@ -400,11 +400,11 @@ class TestMergeSoulEntry(unittest.TestCase):
         )
         new_obs = "## Preferences\n\n- PREFER streaming over batch, faster feedback\n"
         result = _merge_soul_entry(soul, new_obs, "2026-05-02")
-        # Should still be 1 Preferences entry (updated)
+        # Pure append: 2 entries now (dedup is dream's job)
         pref_m = re.search(r"## Preferences\n(.*?)(?=\n## |\Z)", result, re.S)
         entries = [l for l in pref_m.group(1).splitlines() if l.strip().startswith("-")]
-        self.assertEqual(len(entries), 1)
-        # The entry should contain the new text
+        self.assertEqual(len(entries), 2)
+        # Both entries present
         self.assertIn("faster feedback", result)
 
     def test_preferences_new_appends(self):
@@ -424,7 +424,7 @@ class TestMergeSoulEntry(unittest.TestCase):
         self.assertEqual(len(entries), 2)
 
     def test_patterns_dedup_by_pk(self):
-        """Same pk tag replaces existing wording."""
+        """Same pk tag appends (dedup is dream's job now)."""
         soul = (
             "# SOUL.md\n\n"
             "## Identity\n\n"
@@ -435,14 +435,15 @@ class TestMergeSoulEntry(unittest.TestCase):
         )
         new_obs = "## Patterns\n\n- New wording <!-- pk: plan-before-act -->\n"
         result = _merge_soul_entry(soul, new_obs, "2026-05-02")
-        self.assertNotIn("Old wording", result)
+        # Pure append: both entries present (dedup is dream's job)
+        self.assertIn("Old wording", result)
         self.assertIn("New wording", result)
         pat_m = re.search(r"## Patterns\n(.*?)(?=\n## |\Z)", result, re.S)
         entries = [l for l in pat_m.group(1).splitlines() if l.strip().startswith("-")]
-        self.assertEqual(len(entries), 1)
+        self.assertEqual(len(entries), 2)
 
     def test_context_dedup_by_prefix(self):
-        """Same context fact (with since-date variation) deduplicates correctly."""
+        """Same context fact appends (dedup is dream's job now)."""
         soul = (
             "# SOUL.md\n\n"
             "## Identity\n\n"
@@ -451,12 +452,12 @@ class TestMergeSoulEntry(unittest.TestCase):
             "## Context\n\n"
             "- Works at Acme Corp (since 2020) <!-- new: 2026-01-01 -->\n"
         )
-        # New entry: same fact, different since-date → should replace existing
+        # New entry: same fact, different since-date → both appended (dream consolidates later)
         new_obs = "## Context\n\n- Works at Acme Corp (since 2024)\n"
         result = _merge_soul_entry(soul, new_obs, "2026-05-02")
         ctx_m = re.search(r"## Context\n(.*?)(?=\n## |\Z)", result, re.S)
         entries = [l for l in ctx_m.group(1).splitlines() if l.strip().startswith("-")]
-        self.assertEqual(len(entries), 1)
+        self.assertEqual(len(entries), 2)
 
     def test_empty_soul_gets_skeleton(self):
         """Empty soul_content gets sections created automatically."""

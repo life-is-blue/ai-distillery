@@ -30,6 +30,7 @@ from ai_engine import load_dotenv, call_engine, _codex_available
 from ai_prompts import (
     REPORT_SYSTEM, SOUL_SYSTEM, DISTILL_SYSTEM, GROUNDING_SYSTEM,
     LESSONS_SYSTEM, SOUL_SKELETON, LESSONS_SKELETON, MEMORY_SKELETON,
+    DREAM_SYSTEM, MEMORY_DREAM_SYSTEM,
 )
 
 
@@ -1425,14 +1426,10 @@ def _update_soul_section(
 def _merge_soul_entry(
     soul_content: str, new_observations: str, entry_date: str
 ) -> str:
-    """Incrementally merge LLM observations (4-section format) into soul_content.
+    """Append new LLM observations into soul_content (pure append, no dedup).
 
-    For each of the 4 sections, new entries are tagged with <!-- new: date -->
-    and deduplicated against existing entries using section-appropriate logic:
-      Identity   — Jaccard bigram similarity > 0.5 → skip duplicate
-      Preferences — dedup key (text after PREFER/REJECT up to comma) → replace or add
-      Patterns   — pk tag value → replace or add
-      Context    — first 30 chars normalized → replace (update since-date) or add
+    Each entry is tagged with <!-- new: entry_date -->.
+    Dedup and consolidation are dream's responsibility.
     """
     new_sections = _parse_soul_sections(new_observations)
 
@@ -1443,87 +1440,20 @@ def _merge_soul_entry(
 
         # Ensure section exists in soul_content (safety net for migration)
         if f"## {section_name}" not in soul_content:
-            # Append section before end of file
             soul_content = soul_content.rstrip("\n") + f"\n\n## {section_name}\n"
 
-        existing_sections = _parse_soul_sections(soul_content)
-        existing = existing_sections.get(section_name, [])
-
         to_add: list[str] = []
-        to_replace: dict[str, str] = {}
-
         for new_entry in new_entries:
-            # Tag first line with <!-- new: entry_date --> (idempotent)
             lines = new_entry.split("\n")
             first_line = lines[0]
             if "<!-- new:" not in first_line and "<!-- absorbed:" not in first_line:
                 lines[0] = first_line + f" <!-- new: {entry_date} -->"
-            tagged_entry = "\n".join(lines)
+            to_add.append("\n".join(lines))
 
-            # ── Identity: Jaccard similarity ──────────────────────────────
-            if section_name == "Identity":
-                tokens_new = _tokenize_bigram(new_entry)
-                is_dup = any(_jaccard(tokens_new, _tokenize_bigram(ex)) > 0.5
-                             for ex in existing)
-                if not is_dup:
-                    to_add.append(tagged_entry)
-
-            # ── Preferences: dedup by PREFER/REJECT key ───────────────────
-            elif section_name == "Preferences":
-                new_key = _pref_key(lines[0])
-                matched = next(
-                    (ex for ex in existing
-                     if _pref_key(ex.split("\n")[0]) == new_key),
-                    None,
-                )
-                if matched:
-                    to_replace[matched] = tagged_entry
-                else:
-                    to_add.append(tagged_entry)
-
-            # ── Patterns: dedup by <!-- pk: key --> ───────────────────────
-            elif section_name == "Patterns":
-                pk_m = re.search(r"<!--\s*pk:\s*([\w-]+)\s*-->", new_entry)
-                if not pk_m:
-                    to_add.append(tagged_entry)
-                    continue
-                pk = pk_m.group(1)
-                matched = next(
-                    (ex for ex in existing
-                     if re.search(r"<!--\s*pk:\s*" + re.escape(pk) + r"\s*-->", ex)),
-                    None,
-                )
-                if matched:
-                    to_replace[matched] = tagged_entry
-                else:
-                    to_add.append(tagged_entry)
-
-            # ── Context: dedup by normalized first-30-chars prefix ────────
-            elif section_name == "Context":
-                def _ctx_key(text: str) -> str:
-                    # strip HTML comments (new:/absorbed: tags) before keying
-                    clean = re.sub(r"\s*<!--.*?-->", "", text, flags=re.DOTALL)
-                    clean = re.sub(r"\(since[^)]*\)", "", clean).strip().lower()
-                    clean = re.sub(r"\s+", " ", clean)
-                    return clean[:30]
-
-                new_key = _ctx_key(lines[0])
-                matched = next(
-                    (ex for ex in existing if _ctx_key(ex) == new_key),
-                    None,
-                )
-                if matched:
-                    to_replace[matched] = tagged_entry
-                else:
-                    to_add.append(tagged_entry)
-
-        if to_replace or to_add:
-            soul_content = _update_soul_section(
-                soul_content, section_name, to_replace, to_add
-            )
+        if to_add:
+            soul_content = _update_soul_section(soul_content, section_name, {}, to_add)
 
     return soul_content
-
 
 def _rebuild_soul(original_content: str, sections_entries: dict[str, list[str]]) -> str:
     """Rebuild SOUL.md preserving the header (metadata block) and replacing
@@ -1592,147 +1522,72 @@ def _mark_absorbed_soul_entries(soul_path: Path, entry_texts: list[str]) -> None
     if changed:
         soul_path.write_text(content, encoding="utf-8")
 
-
-# ── cmd_dream: mechanical 4-phase consolidation ───────────────────────────
+# ── cmd_dream: LLM-powered semantic consolidation ────────────────────────
 
 def cmd_dream(args):
-    """Consolidate SOUL.md: merge duplicates, prune stale entries, enforce limits."""
+    """Consolidate SOUL.md + MEMORY.md via LLM semantic merge."""
     soul_path = Path(args.soul)
-    if not soul_path.exists():
-        print("SOUL.md not found", file=sys.stderr)
-        return
+    memory_path = Path(args.memory)
+    logs_dir = Path(args.logs)
 
-    content = soul_path.read_text(encoding="utf-8")
-    sections = _parse_soul_sections(content)
-    total = sum(len(v) for v in sections.values())
-
-    if total <= 30:
-        print(f"Dream: {total} entries (≤30), skipping consolidation", file=sys.stderr)
-        return
-
-    # ── Phase 1-2: Orient + Gather (parsing done above) ──────────────────
-
-    # ── Phase 3: Consolidate duplicates within each section ──────────────
-    # Identity: merge similar (Jaccard > 0.5) — keep longer
-    identity = sections["Identity"]
-    merged_identity: list[str] = []
-    for entry in identity:
-        toks = _tokenize_bigram(entry)
-        matched_idx = next(
-            (i for i, ex in enumerate(merged_identity)
-             if _jaccard(toks, _tokenize_bigram(ex)) > 0.5),
-            None,
-        )
-        if matched_idx is None:
-            merged_identity.append(entry)
+    # --- SOUL consolidation ---
+    if soul_path.exists():
+        soul_content = soul_path.read_text(encoding="utf-8")
+        entry_count = len(re.findall(r"^- ", soul_content, re.M))
+        if entry_count <= 20:
+            print(f"Dream: SOUL has {entry_count} entries (≤20), skipping", file=sys.stderr)
         else:
-            # Keep longer entry
-            if len(entry) > len(merged_identity[matched_idx]):
-                merged_identity[matched_idx] = entry
-    sections["Identity"] = merged_identity
+            print(f"Dream: consolidating SOUL.md ({entry_count} entries)...", file=sys.stderr)
+            body_match = re.search(r"^---\s*\n(.+)", soul_content, re.S | re.M)
+            body = body_match.group(1) if body_match else soul_content
 
-    # Preferences: merge same dedup-key — keep latest (the last one seen)
-    prefs: list[str] = []
-    seen_keys: dict[str, int] = {}  # key → index in prefs
-    for entry in sections["Preferences"]:
-        key = _pref_key(entry.split("\n")[0])
-        if key in seen_keys:
-            prefs[seen_keys[key]] = entry  # replace with latest
+            consolidated = call_engine(body, DREAM_SYSTEM)
+            if consolidated and "## Identity" in consolidated:
+                file_count = sum(
+                    1 for _ in logs_dir.rglob("*.jsonl") if "reports" not in _.parts
+                )
+                header = SOUL_SKELETON.format(date=date.today(), count=file_count)
+                new_content = header + "\n" + consolidated.strip() + "\n"
+                soul_path.write_text(new_content, encoding="utf-8")
+                new_count = len(re.findall(r"^- ", new_content, re.M))
+                print(
+                    f"Dream: SOUL consolidated {entry_count} → {new_count} entries",
+                    file=sys.stderr,
+                )
+            else:
+                print("Dream: LLM returned invalid output, skipping SOUL", file=sys.stderr)
+    else:
+        print("Dream: SOUL.md not found, skipping", file=sys.stderr)
+
+    # --- MEMORY consolidation ---
+    if memory_path.exists():
+        mem_content = memory_path.read_text(encoding="utf-8")
+        rule_count = len(re.findall(r"^- ", mem_content, re.M))
+        if rule_count <= 60:
+            print(f"Dream: MEMORY has {rule_count} rules (≤60), skipping", file=sys.stderr)
         else:
-            seen_keys[key] = len(prefs)
-            prefs.append(entry)
-    sections["Preferences"] = prefs
-
-    # Patterns: merge same pk — keep latest wording
-    patterns: list[str] = []
-    seen_pks: dict[str, int] = {}
-    for entry in sections["Patterns"]:
-        pk_m = re.search(r"<!--\s*pk:\s*([\w-]+)\s*-->", entry)
-        if not pk_m:
-            patterns.append(entry)
-            continue
-        pk = pk_m.group(1)
-        if pk in seen_pks:
-            patterns[seen_pks[pk]] = entry  # keep latest
-        else:
-            seen_pks[pk] = len(patterns)
-            patterns.append(entry)
-    sections["Patterns"] = patterns
-
-    # Context: merge same prefix — keep latest
-    ctx_list: list[str] = []
-
-    def _ctx_key(text: str) -> str:
-        clean = re.sub(r"\s*<!--.*?-->", "", text, flags=re.DOTALL)
-        clean = re.sub(r"\(since[^)]*\)", "", clean).strip().lower()
-        clean = re.sub(r"\s+", " ", clean)
-        return clean[:30]
-
-    seen_ctx: dict[str, int] = {}
-    for entry in sections["Context"]:
-        key = _ctx_key(entry.split("\n")[0])
-        if key in seen_ctx:
-            ctx_list[seen_ctx[key]] = entry
-        else:
-            seen_ctx[key] = len(ctx_list)
-            ctx_list.append(entry)
-    sections["Context"] = ctx_list
-
-    # ── Phase 4: Prune to section limits ─────────────────────────────────
-    LIMITS = {"Identity": 5, "Preferences": 15, "Patterns": 20, "Context": 10}
-
-    def _has_new_tag(entry: str) -> bool:
-        return bool(re.search(r"<!--\s*new:\s*\d{4}-\d{2}-\d{2}\s*-->", entry))
-
-    def _has_absorbed_tag(entry: str) -> bool:
-        return bool(re.search(r"<!--\s*absorbed:", entry))
-
-    # Identity: max 5 — drop absorbed first, then by length (shortest first)
-    if len(sections["Identity"]) > LIMITS["Identity"]:
-        ranked = sorted(
-            sections["Identity"],
-            key=lambda e: (not _has_absorbed_tag(e), len(e)),
-            reverse=True,  # keep: not-absorbed + longest
-        )
-        sections["Identity"] = ranked[: LIMITS["Identity"]]
-
-    # Preferences: max 15 — drop absorbed first
-    if len(sections["Preferences"]) > LIMITS["Preferences"]:
-        active = [e for e in sections["Preferences"] if not _has_absorbed_tag(e)]
-        absorbed = [e for e in sections["Preferences"] if _has_absorbed_tag(e)]
-        # Keep all active, then fill from absorbed
-        combined = active + absorbed
-        sections["Preferences"] = combined[: LIMITS["Preferences"]]
-
-    # Patterns: max 20 — drop by pk-count (lowest first)
-    if len(sections["Patterns"]) > LIMITS["Patterns"]:
-        # Use extract_pattern_counts for rank signal (covers both old + new format)
-        pk_counts = extract_pattern_counts(soul_path)
-
-        def _pk_rank(entry: str) -> int:
-            pk_m = re.search(r"<!--\s*pk:\s*([\w-]+)\s*-->", entry)
-            if not pk_m:
-                return 0
-            return pk_counts.get(pk_m.group(1), 0)
-
-        ranked = sorted(sections["Patterns"], key=_pk_rank, reverse=True)
-        sections["Patterns"] = ranked[: LIMITS["Patterns"]]
-
-    # Context: max 10 — drop absorbed/untagged first
-    if len(sections["Context"]) > LIMITS["Context"]:
-        active = [e for e in sections["Context"] if _has_new_tag(e)]
-        rest = [e for e in sections["Context"] if not _has_new_tag(e)]
-        combined = active + rest
-        sections["Context"] = combined[: LIMITS["Context"]]
-
-    # ── Rebuild + write ───────────────────────────────────────────────────
-    new_content = _rebuild_soul(content, sections)
-    soul_path.write_text(new_content, encoding="utf-8")
-    new_total = sum(len(v) for v in sections.values())
-    print(
-        f"Dream: consolidated {total} → {new_total} entries",
-        file=sys.stderr,
-    )
+            print(f"Dream: consolidating MEMORY.md ({rule_count} rules)...", file=sys.stderr)
+            consolidated = call_engine(mem_content, MEMORY_DREAM_SYSTEM)
+            if consolidated and "## MUST" in consolidated:
+                version_m = re.search(r"Version: (\d+)", mem_content)
+                version = int(version_m.group(1)) + 1 if version_m else 1
+                header = (
+                    f"# MEMORY.md — Behavioral Rules\n"
+                    f"> Source: SOUL.md + dream | Updated: {date.today()} | "
+                    f"Version: {version} (dream-consolidated)\n"
+                    f"> Precedence: explicit user instruction > MEMORY.md > project CLAUDE.md\n\n"
+                )
+                new_content = header + consolidated.strip() + "\n"
+                memory_path.write_text(new_content, encoding="utf-8")
+                new_count = len(re.findall(r"^- ", new_content, re.M))
+                print(
+                    f"Dream: MEMORY consolidated {rule_count} → {new_count} rules",
+                    file=sys.stderr,
+                )
+            else:
+                print("Dream: LLM returned invalid output, skipping MEMORY", file=sys.stderr)
+    else:
+        print("Dream: MEMORY.md not found, skipping", file=sys.stderr)
 
 
 def _parse_all_lesson_pits(lessons_path: Path) -> list[tuple[str, str]]:
@@ -2116,7 +1971,9 @@ def main():
     sm = sub.add_parser("sync-memory")
     sm.add_argument("--logs", default=default_logs)
     dr = sub.add_parser("dream")
+    dr.add_argument("--logs", default=default_logs)
     dr.add_argument("--soul", default=str(Path(default_logs) / "SOUL.md"))
+    dr.add_argument("--memory", default=str(Path(default_logs) / "MEMORY.md"))
     args = p.parse_args()
     {"report": cmd_report, "soul": cmd_soul, "push": cmd_push,
      "distill": cmd_distill, "lessons": cmd_lessons,

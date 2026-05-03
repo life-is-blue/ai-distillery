@@ -71,7 +71,7 @@ soul:
 	@python3 ai_report.py soul --logs $(LOGS) --soul $(LOGS)/SOUL.md
 
 dream:
-	@python3 ai_report.py dream --soul $(LOGS)/SOUL.md
+	@python3 ai_report.py dream --logs $(LOGS) --soul $(LOGS)/SOUL.md --memory $(LOGS)/MEMORY.md
 
 distill:
 	@python3 ai_report.py distill --logs $(LOGS) --soul $(LOGS)/SOUL.md --memory $(LOGS)/MEMORY.md --lessons $(LOGS)/LESSONS.md
