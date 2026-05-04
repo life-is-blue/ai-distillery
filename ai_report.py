@@ -30,7 +30,7 @@ from ai_engine import load_dotenv, call_engine, _codex_available
 from ai_prompts import (
     REPORT_SYSTEM, SOUL_SYSTEM, DISTILL_SYSTEM, GROUNDING_SYSTEM,
     LESSONS_SYSTEM, SOUL_SKELETON, LESSONS_SKELETON, MEMORY_SKELETON,
-    DREAM_SYSTEM, MEMORY_DREAM_SYSTEM,
+    DREAM_SYSTEM, MEMORY_DREAM_SYSTEM, AGENTS_SYSTEM,
 )
 
 
@@ -1534,8 +1534,10 @@ def cmd_dream(args):
     if soul_path.exists():
         soul_content = soul_path.read_text(encoding="utf-8")
         entry_count = len(re.findall(r"^- ", soul_content, re.M))
-        if entry_count <= 20:
-            print(f"Dream: SOUL has {entry_count} entries (≤20), skipping", file=sys.stderr)
+        has_unabsorbed = "<!-- new:" in soul_content
+        if entry_count <= 20 or not has_unabsorbed:
+            reason = f"{entry_count} entries (≤20)" if entry_count <= 20 else "no unabsorbed entries"
+            print(f"Dream: SOUL {reason}, skipping", file=sys.stderr)
         else:
             print(f"Dream: consolidating SOUL.md ({entry_count} entries)...", file=sys.stderr)
             body_match = re.search(r"^---\s*\n(.+)", soul_content, re.S | re.M)
@@ -1563,10 +1565,12 @@ def cmd_dream(args):
     if memory_path.exists():
         mem_content = memory_path.read_text(encoding="utf-8")
         rule_count = len(re.findall(r"^- ", mem_content, re.M))
-        if rule_count <= 60:
-            print(f"Dream: MEMORY has {rule_count} rules (≤60), skipping", file=sys.stderr)
+        has_universal = "### Universal" in mem_content
+        if rule_count <= 60 and has_universal:
+            print(f"Dream: MEMORY has {rule_count} rules (≤60) with Universal layering, skipping", file=sys.stderr)
         else:
-            print(f"Dream: consolidating MEMORY.md ({rule_count} rules)...", file=sys.stderr)
+            reason = "missing Universal layering" if not has_universal else f"{rule_count} rules"
+            print(f"Dream: consolidating MEMORY.md ({reason})...", file=sys.stderr)
             consolidated = call_engine(mem_content, MEMORY_DREAM_SYSTEM)
             if consolidated and "## MUST" in consolidated:
                 version_m = re.search(r"Version: (\d+)", mem_content)
@@ -1588,6 +1592,38 @@ def cmd_dream(args):
                 print("Dream: LLM returned invalid output, skipping MEMORY", file=sys.stderr)
     else:
         print("Dream: MEMORY.md not found, skipping", file=sys.stderr)
+
+    # --- Phase 3: Generate AGENTS.md from SOUL + MEMORY.Universal ---
+    if soul_path.exists() and memory_path.exists():
+        soul_body_match = re.search(r'^---\s*\n(.+)', soul_path.read_text(), re.S | re.M)
+        soul_body = soul_body_match.group(1) if soul_body_match else ""
+
+        mem_content = memory_path.read_text()
+        # Extract only Universal sub-blocks from each section
+        universal_blocks = []
+        for section in ["MUST", "MUST NOT", "PREFER", "CONTEXT"]:
+            # Find ## SECTION then ### Universal block
+            pattern = rf'^## {re.escape(section)}\s*\n(.*?)(?=^## |\Z)'
+            m = re.search(pattern, mem_content, re.S | re.M)
+            if not m:
+                continue
+            section_body = m.group(1)
+            # Extract ### Universal block
+            uni_m = re.search(r'### Universal[^\n]*\n(.*?)(?=^### |\Z)', section_body, re.S | re.M)
+            if uni_m:
+                universal_blocks.append(f"## {section}\n{uni_m.group(1).strip()}")
+
+        if soul_body and universal_blocks:
+            combined = soul_body + "\n\n---\n\n# MEMORY (Universal only)\n\n" + "\n\n".join(universal_blocks)
+            print("Dream: generating AGENTS.md from SOUL + MEMORY.Universal...", file=sys.stderr)
+            agents_content = call_engine(combined, AGENTS_SYSTEM)
+            if agents_content and agents_content.strip().startswith("#"):
+                agents_path = soul_path.parent / "AGENTS.md"
+                agents_path.write_text(agents_content.strip() + "\n", encoding="utf-8")
+                lines = len(agents_content.splitlines())
+                print(f"Dream: AGENTS.md generated ({lines} lines)", file=sys.stderr)
+            else:
+                print("Dream: LLM returned invalid AGENTS.md, skipping", file=sys.stderr)
 
 
 def _parse_all_lesson_pits(lessons_path: Path) -> list[tuple[str, str]]:
