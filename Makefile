@@ -60,6 +60,9 @@ harvest:
 		$(CONVERTER) -f codex -t jsonl "$$src" "$$tgt.jsonl" && \
 		echo "OK $$tgt" >&2; \
 	done
+	@# --- Auto-sync: commit+push new harvested sessions to ai-memory ---
+	@cd $(LOGS) && git add -A && \
+		(git diff --cached --quiet || (git commit -m "harvest: $$(date +%Y-%m-%d\ %H:%M) on $$(hostname -s)" --quiet && git push --quiet && echo "OK harvest synced to ai-memory" >&2)) || true
 
 report:
 	@python3 ai_report.py report --logs $(LOGS)
