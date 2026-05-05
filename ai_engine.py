@@ -5,11 +5,11 @@ All cmd_* functions in ai_report.py call exactly one function: call_engine().
 This module handles engine selection, context limits, and batching internally.
 """
 
-import json, os, re, shutil, subprocess, sys
+import json, os, re, shutil, subprocess, sys, time
 from functools import lru_cache
 from pathlib import Path
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 
 def load_dotenv(path: Path = None):
@@ -30,7 +30,11 @@ def load_dotenv(path: Path = None):
 # ---------------------------------------------------------------------------
 
 def call_llm(prompt: str, system: str = "", max_tokens: int = None) -> str:
-    """OpenAI-compatible HTTP call. Thin wrapper, no retry, no batching."""
+    """OpenAI-compatible HTTP call with retry for transient errors.
+
+    Retries on: HTTP 429/5xx, URLError (timeout/connection), JSON parse errors.
+    Exits non-zero on: auth failure (401/403), missing API key, max retries exhausted.
+    """
     api_key = os.environ.get("LLM_API_KEY")
     if not api_key:
         print("LLM_API_KEY not set", file=sys.stderr); sys.exit(1)
@@ -43,14 +47,37 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = None) -> str:
     if max_tokens is None:
         max_tokens = int(os.environ.get("LLM_MAX_TOKENS", 2000))
     payload = json.dumps({"model": model, "messages": msgs, "max_tokens": max_tokens}).encode()
-    req = Request(f"{base}/chat/completions", data=payload,
-                  headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
-    try:
-        with urlopen(req, timeout=180) as resp:
-            data = json.loads(resp.read())
-            return data["choices"][0]["message"].get("content") or ""
-    except HTTPError as e:
-        print(f"LLM API error: {e.code} {e.read().decode()[:200]}", file=sys.stderr); sys.exit(1)
+
+    max_retries = int(os.environ.get("LLM_MAX_RETRIES", 3))
+    for attempt in range(max_retries + 1):
+        req = Request(f"{base}/chat/completions", data=payload,
+                      headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+        try:
+            with urlopen(req, timeout=180) as resp:
+                data = json.loads(resp.read())
+                return data["choices"][0]["message"].get("content") or ""
+        except HTTPError as e:
+            body = e.read().decode()[:200]
+            # Auth errors: never retry, fail immediately
+            if e.code in (401, 403):
+                print(f"LLM auth error {e.code}: {body}", file=sys.stderr); sys.exit(1)
+            # Retryable: 429 rate limit, 5xx server errors
+            if e.code == 429 or e.code >= 500:
+                if attempt < max_retries:
+                    delay = 2 ** attempt
+                    print(f"LLM {e.code} retry {attempt+1}/{max_retries} after {delay}s: {body}", file=sys.stderr)
+                    time.sleep(delay)
+                    continue
+            # Non-retryable HTTP error or retries exhausted
+            print(f"LLM API error: {e.code} {body}", file=sys.stderr); sys.exit(1)
+        except (URLError, json.JSONDecodeError, KeyError) as e:
+            # Network timeout, connection error, malformed response
+            if attempt < max_retries:
+                delay = 2 ** attempt
+                print(f"LLM transient error retry {attempt+1}/{max_retries} after {delay}s: {type(e).__name__}: {e}", file=sys.stderr)
+                time.sleep(delay)
+                continue
+            print(f"LLM transient error (retries exhausted): {type(e).__name__}: {e}", file=sys.stderr); sys.exit(1)
 
 
 def _call_codex(content: str, system: str) -> str:
