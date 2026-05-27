@@ -29,6 +29,9 @@ from ai_report import (
     _merge_soul_entry,
     _parse_soul_sections,
     extract_unabsorbed_soul,
+    append_skip,
+    read_and_clear_skip_buffer,
+    _parse_skipped_section,
 )
 from ai_prompts import MEMORY_SKELETON
 
@@ -565,6 +568,64 @@ class TestExtractUnabsorbedSoul(unittest.TestCase):
         finally:
             os.unlink(path)
 
+
+
+
+class TestSkipBuffer(unittest.TestCase):
+    """Tests for skip-buffer read/write/clear."""
+
+    def test_append_and_read_clears(self):
+        with tempfile.TemporaryDirectory() as d:
+            logs = Path(d)
+            append_skip(logs, 'lessons', [{"slug": "x", "reason": "covered"}])
+            entries = read_and_clear_skip_buffer(logs)
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]['source'], 'lessons')
+            self.assertEqual(entries[0]['slug'], 'x')
+            # Buffer should be cleared
+            self.assertEqual(read_and_clear_skip_buffer(logs), [])
+
+    def test_empty_dir_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            entries = read_and_clear_skip_buffer(Path(d))
+            self.assertEqual(entries, [])
+
+    def test_multiple_sources(self):
+        with tempfile.TemporaryDirectory() as d:
+            logs = Path(d)
+            append_skip(logs, 'lessons', [{"slug": "a", "reason": "covered"}])
+            append_skip(logs, 'gene', [{"pk": "b", "decision": "skip", "reason": "weak"}])
+            entries = read_and_clear_skip_buffer(logs)
+            self.assertEqual(len(entries), 2)
+            sources = {e['source'] for e in entries}
+            self.assertIn('lessons', sources)
+            self.assertIn('gene', sources)
+            # After clear
+            self.assertEqual(read_and_clear_skip_buffer(logs), [])
+
+
+class TestParseSkippedSection(unittest.TestCase):
+    """Tests for _parse_skipped_section."""
+
+    def test_strips_skipped_section(self):
+        raw = "ADD MUST: some rule\n\n## Skipped\n- slug-a: covered by rule X\n"
+        main, items = _parse_skipped_section(raw)
+        self.assertEqual(main.strip(), "ADD MUST: some rule")
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]['slug'], 'slug-a')
+        self.assertIn('covered', items[0]['reason'])
+
+    def test_none_skipped(self):
+        raw = "ADD MUST: some rule\n\n## Skipped\nNone"
+        main, items = _parse_skipped_section(raw)
+        self.assertEqual(items, [])
+        self.assertIn("ADD MUST", main)
+
+    def test_no_skipped_section(self):
+        raw = "ADD MUST: some rule"
+        main, items = _parse_skipped_section(raw)
+        self.assertEqual(main, raw)
+        self.assertEqual(items, [])
 
 
 class TestGeneReviewParse(unittest.TestCase):

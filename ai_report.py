@@ -2040,6 +2040,26 @@ def cmd_daily(args):
             s8.append(f"{i}. {t}")
     else:
         s8.append("无待办 — 一切正常")
+
+    # Read and clear skip buffer for today
+    skips = read_and_clear_skip_buffer(logs_dir)
+    if skips:
+        by_source: dict = {}
+        for s in skips:
+            by_source.setdefault(s['source'], []).append(s)
+        s8.append("\n### 今日 Skip 摘要\n")
+        for source in ('lessons', 'distill', 'gene'):
+            items = by_source.get(source, [])
+            if not items:
+                continue
+            s8.append(f"\n**{source.upper()}** ({len(items)} 项跳过):")
+            for item in items[:5]:
+                reason = item.get('reason', item.get('decision', '?'))
+                label = item.get('slug') or item.get('pk') or item.get('summary', '?')
+                s8.append(f"- `{label}`: {reason}")
+            if len(items) > 5:
+                s8.append(f"- ...及其他 {len(items)-5} 项")
+
     sections.append("\n".join(s8))
 
 
