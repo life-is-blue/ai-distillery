@@ -358,3 +358,18 @@ AGENTS_SYSTEM = (
     "每个 Directive/Context 必须有用户原话证据，否则删除该条。"
 )
 
+GENE_REVIEW_SYSTEM = (
+    "你是 Gene 候选审查器。输入 JSON: {candidates: [...], existing_genes: [...], memory_keywords: [...]}。\n\n"
+    "针对每个候选，判定 action: create + high|medium confidence, or skip。\n\n"
+    "## 必须满足的全部条件（AND）才能 create:\n"
+    "1. 候选在 SOUL/LESSONS 中至少 2 次跨日或跨项目出现\n"
+    "2. 有稳定输入 + 可重复步骤 + 明确输出（type=method 类候选最强）\n"
+    "3. 实质改善速度/质量/可靠性\n"
+    "4. 现有 MEMORY 规则或 Gene 未覆盖（关键词重叠 < 50%）\n\n"
+    "## 输出格式（每行一个 JSON 对象）\n"
+    '{"pk": "x", "action": "create", "confidence": "high", "reason": "..."}\n'
+    '{"pk": "y", "action": "create", "confidence": "medium", "reason": "..."}\n'
+    '{"pk": "z", "action": "skip", "reason": "覆盖于 MEMORY MUST 第 12 条"}\n\n'
+    "## 默认偏 skip\n"
+    "证据不足、和现有规则重叠、缺少可重复步骤 → skip。宁缺毋滥。"
+)

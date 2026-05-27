@@ -566,5 +566,42 @@ class TestExtractUnabsorbedSoul(unittest.TestCase):
             os.unlink(path)
 
 
+
+class TestGeneReviewParse(unittest.TestCase):
+    """Test that gene review JSONL output is parsed correctly."""
+
+    def test_parses_jsonl_decisions(self):
+        sample = (
+            '{"pk": "a", "action": "create", "confidence": "high", "reason": "new"}\n'
+            '{"pk": "b", "action": "skip", "reason": "covered"}\n'
+        )
+        decisions = []
+        for line in sample.splitlines():
+            if line.strip().startswith('{'):
+                decisions.append(json.loads(line))
+        self.assertEqual(len(decisions), 2)
+        self.assertEqual(decisions[0]["action"], "create")
+        self.assertEqual(decisions[0]["confidence"], "high")
+        self.assertEqual(decisions[1]["action"], "skip")
+        self.assertEqual(decisions[1]["reason"], "covered")
+
+    def test_skips_non_json_lines(self):
+        sample = (
+            'Some header text\n'
+            '{"pk": "x", "action": "create", "confidence": "medium", "reason": "ok"}\n'
+            '# comment\n'
+        )
+        decisions = []
+        for line in sample.splitlines():
+            line = line.strip()
+            if line.startswith('{'):
+                try:
+                    decisions.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["pk"], "x")
+
+
 if __name__ == "__main__":
     unittest.main()

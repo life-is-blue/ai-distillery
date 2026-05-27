@@ -30,7 +30,7 @@ from ai_engine import load_dotenv, call_engine, _codex_available
 from ai_prompts import (
     REPORT_SYSTEM, SOUL_SYSTEM, DISTILL_SYSTEM, GROUNDING_SYSTEM,
     LESSONS_SYSTEM, SOUL_SKELETON, LESSONS_SKELETON, MEMORY_SKELETON,
-    DREAM_SYSTEM, MEMORY_DREAM_SYSTEM, AGENTS_SYSTEM,
+    DREAM_SYSTEM, MEMORY_DREAM_SYSTEM, AGENTS_SYSTEM, GENE_REVIEW_SYSTEM,
 )
 
 
@@ -1173,29 +1173,89 @@ def cmd_distill(args):
     else:
         print(f"Distill: {total} entries marked absorbed (NOP)", file=sys.stderr)
 
-    # Phase 6: Gene auto-extraction — pk≥3 days → create gene.yaml
+    # Phase 6: Gene candidate review (LLM-gated, multi-condition AND)
     if pattern_counts:
         genes_dir = Path(args.logs) / "genes"
-        lesson_text_by_pk = {}  # pk → list of entry texts
+        logs_dir = Path(args.logs)
+
+        # Build structured lesson_entries for this phase
+        lesson_entries = []
         if lessons_path.exists():
             lc = lessons_path.read_text(encoding="utf-8")
-            for entry in re.split(r'(?=^## [\w-])', lc, flags=re.M):
-                pk_m = re.search(r'pk:\s*([\w-]+)', entry)
+            for entry_text in re.split(r'(?=^## [\w-])', lc, flags=re.M):
+                pk_m = re.search(r'pk:\s*([\w-]+)', entry_text)
+                slug_m = re.match(r'^## ([\w-]+)', entry_text.strip())
+                type_m = re.search(r'type:\s*([\w-]+)', entry_text)
+                area_m = re.search(r'area:\s*([\w-]+)', entry_text)
                 if pk_m:
-                    lesson_text_by_pk.setdefault(pk_m.group(1), []).append(entry)
+                    lesson_entries.append({
+                        'pk': pk_m.group(1),
+                        'slug': slug_m.group(1) if slug_m else '',
+                        'type': type_m.group(1) if type_m else 'trap',
+                        'area': area_m.group(1) if area_m else 'unknown',
+                        'text': entry_text.strip(),
+                    })
 
-        for pk, cnt in pattern_counts.items():
-            if cnt < 3:
+        candidates = []
+        for pk, days in pattern_counts.items():
+            if days < 2:
                 continue
-            area_m = None
-            for text in lesson_text_by_pk.get(pk, []):
-                area_m = re.search(r'area:\s*([\w-]+)', text)
-                if area_m:
-                    break
-            area = area_m.group(1) if area_m else "unknown"
-            entries = lesson_text_by_pk.get(pk, [])
-            if entries:
-                _auto_create_gene(genes_dir, pk, area, entries, date.today())
+            pk_lessons = [e for e in lesson_entries if e.get('pk') == pk]
+            candidates.append({
+                "pk": pk,
+                "days": days,
+                "lessons": [{"slug": l.get('slug'), "type": l.get('type', 'trap'),
+                              "preview": l.get('text', '')[:200]} for l in pk_lessons[:3]]
+            })
+
+        if candidates:
+            existing_genes = (
+                [p.name for p in genes_dir.iterdir()
+                 if p.is_dir() and not p.name.startswith('.')]
+                if genes_dir.exists() else []
+            )
+            mem_keywords = re.findall(r'\b[a-z]{4,}\b', memory_path.read_text(encoding="utf-8").lower()
+                                      if memory_path.exists() else "")[:200]
+
+            review_input = json.dumps({
+                "candidates": candidates,
+                "existing_genes": existing_genes,
+                "memory_keywords": list(set(mem_keywords)),
+            }, ensure_ascii=False)
+
+            review_output = call_engine(review_input, GENE_REVIEW_SYSTEM)
+
+            skip_items = []
+            for line in (review_output or "").splitlines():
+                line = line.strip()
+                if not line.startswith('{'):
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                pk = d.get("pk")
+                if not pk:
+                    continue
+                action = d.get("action", "skip")
+                confidence = d.get("confidence", "")
+                reason = d.get("reason", "")
+
+                if action == "create" and confidence == "high":
+                    pk_lessons = [e for e in lesson_entries if e.get('pk') == pk]
+                    area = pk_lessons[0].get('area', 'general') if pk_lessons else 'general'
+                    pk_texts = [e['text'] for e in pk_lessons]
+                    _auto_create_gene(genes_dir, pk, area, pk_texts, date.today())
+                    print(f"Gene auto-created: {pk} (high confidence) — {reason}", file=sys.stderr)
+                elif action == "create" and confidence == "medium":
+                    print(f"Gene candidate (medium, needs human review): {pk} — {reason}", file=sys.stderr)
+                    skip_items.append({"pk": pk, "decision": "needs-review", "reason": reason})
+                else:
+                    print(f"Gene skip: {pk} — {reason}", file=sys.stderr)
+                    skip_items.append({"pk": pk, "decision": "skip", "reason": reason})
+
+            if skip_items:
+                append_skip(logs_dir, 'gene', skip_items)
 
     # Phase 7: MEMORY.md health check (mechanical)
     if memory_path.exists():
