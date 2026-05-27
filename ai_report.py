@@ -37,6 +37,92 @@ from ai_prompts import (
 load_dotenv()
 
 
+# ---------------------------------------------------------------------------
+# LLM output parsing helpers
+# ---------------------------------------------------------------------------
+
+def _parse_skipped_section(raw: str) -> tuple:
+    """Split LLM output into (main_content, skipped_items).
+
+    The ## Skipped section at the end of lessons/distill output is metadata
+    for the skip-buffer — it should NOT be written to LESSONS.md or MEMORY.md.
+    Returns (main_text, list_of_dicts) where each dict has at least a "reason" key.
+    """
+    if not raw:
+        return raw, []
+    # Find ## Skipped section (must be a top-level ## heading)
+    skip_match = re.search(r'(?:^|\n)## Skipped\n', raw)
+    if not skip_match:
+        return raw, []
+    main_part = raw[:skip_match.start()].rstrip()
+    skip_part = raw[skip_match.end():].strip()
+    if not skip_part or skip_part.lower() == "none":
+        return main_part, []
+    items = []
+    for line in skip_part.splitlines():
+        line = line.strip()
+        if not line or line.lower() == "none":
+            continue
+        # Strip leading "- "
+        if line.startswith("- "):
+            line = line[2:]
+        # Try "slug: reason" format
+        if ": " in line:
+            slug, reason = line.split(": ", 1)
+            items.append({"slug": slug.strip(), "reason": reason.strip()})
+        else:
+            items.append({"reason": line})
+    return main_part, items
+
+
+# ---------------------------------------------------------------------------
+# Skip-buffer helpers: shared by cmd_lessons, cmd_distill, cmd_daily
+# ---------------------------------------------------------------------------
+
+def _skip_buffer_path(logs_dir: Path) -> Path:
+    return logs_dir / ".skip-buffer.jsonl"
+
+
+def append_skip(logs_dir: Path, source: str, items: list):
+    """Append skip entries to buffer. source: 'lessons'|'distill'|'gene'."""
+    if not items:
+        return
+    path = _skip_buffer_path(logs_dir)
+    today = str(date.today())
+    with path.open("a", encoding="utf-8") as f:
+        for item in items:
+            entry = {"date": today, "source": source, **item}
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def read_and_clear_skip_buffer(logs_dir: Path) -> list:
+    """Read all skip entries for today, then clear the file."""
+    path = _skip_buffer_path(logs_dir)
+    if not path.exists():
+        return []
+    today = str(date.today())
+    all_lines = path.read_text(encoding="utf-8").splitlines()
+    entries = []
+    other_lines = []
+    for line in all_lines:
+        if not line.strip():
+            continue
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if e.get("date") == today:
+            entries.append(e)
+        else:
+            other_lines.append(line)
+    # Clear today's entries; keep other days (rare)
+    if other_lines:
+        path.write_text("\n".join(other_lines) + "\n", encoding="utf-8")
+    elif path.exists():
+        path.unlink()
+    return entries
+
+
 def _ts_to_date(ts) -> date | None:
     """Parse meta.timestamp (int millis/seconds or ISO string) to a local-time date."""
     if ts is None or isinstance(ts, bool):
@@ -460,6 +546,12 @@ def cmd_lessons(args):
 
     if not raw or raw.strip() == "NONE":
         print(f"No lessons for {target_date}", file=sys.stderr); return
+
+    # Parse and strip ## Skipped section (metadata only — not written to LESSONS.md)
+    raw, skipped_lessons = _parse_skipped_section(raw)
+    if skipped_lessons:
+        append_skip(logs_dir, 'lessons', skipped_lessons)
+        print(f"Lessons: {len(skipped_lessons)} skipped (forwarded to skip-buffer)", file=sys.stderr)
 
     entries = parse_lesson_entries(raw, target_date)
     entries = lessons_quality_gate(entries)
@@ -1052,6 +1144,13 @@ def cmd_distill(args):
     prompt = f"## Current MEMORY.md\n\n{current_memory}\n\n## New Input\n\n{obs_text}{pattern_section}"
     print(f"Distill: {len(all_unabsorbed)} entries ({len(prompt)//1024}KB prompt)", file=sys.stderr)
     raw_diff = call_engine(prompt, DISTILL_SYSTEM)
+
+    # Parse and strip ## Skipped section from distill output
+    if raw_diff:
+        raw_diff, skipped_distill = _parse_skipped_section(raw_diff)
+        if skipped_distill:
+            append_skip(Path(args.logs), 'distill', skipped_distill)
+            print(f"Distill: {len(skipped_distill)} candidates skipped (forwarded to skip-buffer)", file=sys.stderr)
 
     # Phase 4: parse and apply
     ops = parse_distill_ops(raw_diff)

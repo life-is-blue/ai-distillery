@@ -17,7 +17,7 @@ REPORT_SYSTEM = (
 SOUL_SYSTEM = (
     "You build an ACTIONABLE mental model of a developer from AI session logs.\n"
     "Focus PRIMARILY on [user] messages — they reveal true intent, values, and preferences.\n"
-    "Output 3-5 entries in Chinese, organized into 4 categories:\n\n"
+    "Output 0-5 high-signal entries in Chinese (output `NONE` if insufficient evidence), organized into 4 categories:\n\n"
     "## Categories (output ONLY categories with genuine evidence; do NOT force-fit):\n\n"
     "### Identity（身份画像）\n"
     "Who is this person? Expertise level, role, goals, cognitive style.\n"
@@ -49,6 +49,12 @@ SOUL_SYSTEM = (
     "- 运行环境、部署目标、团队约束、外部系统指针\n"
     "- 包含时效性：标注发现日期\n"
     "Format: `- <事实> (since YYYY-MM-DD)`\n\n"
+    "## 输出门槛（宁缺毋滥）\n"
+    "默认输出 0 条。**只有满足全部条件才输出某条**:\n"
+    "1. 有具体证据锚点（用户原话/文件名/命令）\n"
+    "2. 不与历史 SOUL.md 已有条目语义重复（grounding 阶段会检查）\n"
+    "3. 揭示新维度（不是已知模式的重复表述）\n\n"
+    "不满足 → 输出 `NONE`（一行）即可。**禁止硬凑**: 宁可 0-2 条高质量，不要 3-5 条噪音。\n\n"
     "## Exclusion Rules（绝不记录）:\n"
     "1. 从代码/git 历史可推导的信息（如'项目用 Python'——看 import 就知道）\n"
     "2. 临时任务细节（如'正在修 bug #123'）\n"
@@ -116,7 +122,15 @@ DISTILL_SYSTEM = (
     "STRENGTHEN MUST: Evidence before claiming fixed → Evidence before claiming fixed: show test output, bench before/after, curl response, or log tail\n"
     "ADD MUST_NOT: Use vendor-specific prefixes in skill naming (e.g., minimax-)\n"
     "WEAKEN MUST: 从 MUST 降级到 PREFER 的规则内容\n"
-    "NOP")
+    "NOP\n\n"
+    "## 现有规则查重（Skip 优先）\n"
+    "每条候选输入在生成 ADD 前必须检查：\n"
+    "- 已被 MEMORY.md 哪条规则覆盖？→ 输出 `NOP <reason: covered by ...>`\n"
+    "- 部分覆盖、需要加强？→ 输出 STRENGTHEN\n"
+    "- 完全新维度？→ 输出 ADD\n\n"
+    "## 输出格式扩展\n"
+    "正常 ops 之后追加 `## Skipped` 段，每行: `- <候选摘要>: <已覆盖的现有规则>`\n"
+    "无跳过则 `## Skipped\\nNone`。")
 
 GROUNDING_SYSTEM = (
     "你是一个事实核查员。\n"
@@ -205,7 +219,16 @@ LESSONS_SYSTEM = (
     "  方法论必须是多步骤可复用流程（带编号步骤），不是单句建议。\n"
     "  '应该先规划'不是方法论，'1)探索→2)对齐→3)计划→4)执行→5)验证'才是。\n"
     "- 用中文写字段内容\n"
-    "- 当前分析日期: {date}")
+    "- 当前分析日期: {date}\n\n"
+    "## 复用检查（避免重复造规则）\n"
+    "写 lesson 前先判断:\n"
+    "- 该规则是否已存在于 MEMORY.md？→ 不要写新 lesson\n"
+    "- 与已有规则相似但更严格？→ 不写新 lesson（让 distill 用 STRENGTHEN 处理）\n"
+    "- 完全新维度？→ 写新 lesson\n\n"
+    "## 输出格式（追加 Skipped 段）\n"
+    "正常 lesson 之后追加 `## Skipped` 段，每行: `- <slug>: <skip 原因>`\n"
+    "若无跳过，输出 `## Skipped\\nNone`。\n"
+    "Skipped 段不写入 LESSONS.md，仅供日报统计。")
 
 SOUL_SKELETON = (
     "# SOUL.md — Actionable Mental Model\n\n"
@@ -329,5 +352,9 @@ AGENTS_SYSTEM = (
     "- 跳过 project-specific 细节（那是各项目自己 CLAUDE.md 的事）\n"
     "- 长度控制在 200-300 行，超过说明太啰嗦\n\n"
     "## 输出格式\n"
-    "直接输出完整 AGENTS.md 内容（从 '# AGENTS.md' 开始），markdown 格式。"
+    "直接输出完整 AGENTS.md 内容（从 '# AGENTS.md' 开始），markdown 格式。\n\n"
+    "## 长度控制\n"
+    "若 SOUL/MEMORY 信息密度不足，宁可输出 100 行高密度内容。"
+    "每个 Directive/Context 必须有用户原话证据，否则删除该条。"
 )
+
