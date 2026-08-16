@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-ai-distillery / ai-log-converter - v2.1.0
+ai-distillery / ai-log-converter - v2.3.0
 "Talk is cheap. Show me the code."
 
-Convert AI conversation logs (Claude, Gemini, CodeBuddy, Codex) to readable formats.
+Convert AI conversation logs (Claude, Gemini, CodeBuddy, Codex, Cursor) to readable formats.
 
 Features:
 - Multi-format output: Markdown (md), Plain Text (txt), Normalized JSONL (jsonl)
@@ -13,7 +13,7 @@ Features:
 - Zero dependencies. Unix pipe friendly.
 """
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 import argparse
 import json
@@ -43,6 +43,8 @@ class Harness:
             (r'<local-command-caveat>.*?</local-command-caveat>', ""),
             (r'<thinking>(.*?)</thinking>', r"[thought] \1"),
             (r'<local-command-stdout>(.*?)</local-command-stdout>', r"\1"),
+            (r'<timestamp>.*?</timestamp>\n?', ""),
+            (r'<user_query>\s*(.*?)\s*</user_query>', r"\1"),
             (r'\n{3,}', "\n\n")
         ]
         for p, r in patterns:
@@ -167,7 +169,20 @@ def map_codex(entry: dict) -> Generator[dict, None, None]:
     elif ptype == "function_call_output":
         yield {"role": "tool", "content": [{"type": "tool_result", "name": p.get("name"), "content": p.get("output", "")}], "meta": {"timestamp": ts}}
 
-MAPPER_REGISTRY = {"claude": map_claude, "gemini": map_gemini, "codebuddy": map_codebuddy, "codex": map_codex}
+def map_cursor(entry: dict) -> Generator[dict, None, None]:
+    role = entry.get("role")
+    if role not in ("user", "assistant"): return
+    content = entry.get("message", {}).get("content", [])
+    if isinstance(content, str): content = [{"type": "text", "text": content}]
+    res = []
+    for b in content:
+        t = b.get("type")
+        if t == "text": res.append({"type": "text", "text": Harness.clean(b.get("text", ""))})
+        elif t == "tool_use": res.append({"type": "tool_call", "name": b.get("name"), "input": b.get("input")})
+        elif t == "tool_result": res.append({"type": "tool_result", "content": b.get("content")})
+    if res: yield {"role": role, "content": res, "meta": {"timestamp": entry.get("timestamp")}}
+
+MAPPER_REGISTRY = {"claude": map_claude, "gemini": map_gemini, "codebuddy": map_codebuddy, "codex": map_codex, "cursor": map_cursor}
 DETECT_PEEK_LIMIT = 50
 
 # === IO and Detect ===
@@ -203,6 +218,8 @@ def detect_format(samples: Iterable[dict]) -> Optional[str]:
             return "codex"
         if "type" in sample and "role" in sample and "content" in sample:
             return "codebuddy"
+        if "role" in sample and isinstance(sample.get("message"), dict) and "content" in sample["message"]:
+            return "cursor"
 
     return None
 

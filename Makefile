@@ -38,6 +38,18 @@ harvest:
 			echo "OK $$tgt" >&2; \
 		done; \
 	done
+	@# --- tclaude (Tencent internal Claude Code fork, same JSONL schema) ---
+	@find $(HOME)/.tclaude/projects -maxdepth 3 -name '*.jsonl' -not -path '*/subagents/*' 2>/dev/null | while read src; do \
+		session=$$(basename "$$src" .jsonl); \
+		project=$$(echo "$$src" | sed 's|.*/projects/||' | cut -d/ -f1 | sed 's|^-\?[^-]*-home-[^-]*-project-\?||;s|^Users-[^-]*-Coding-projects-\(active-\)\?||;s|^-||'); \
+		project=$${project:-project}; \
+		tgt=$(LOGS)/tclaude/$$project/$$session; \
+		[ -f "$$tgt.jsonl" ] && [ "$$tgt.jsonl" -nt "$$src" ] && continue; \
+		mkdir -p $$(dirname "$$tgt"); \
+		$(CONVERTER) -f claude "$$src" "$$tgt.md" && \
+		$(CONVERTER) -f claude -t jsonl "$$src" "$$tgt.jsonl" && \
+		echo "OK $$tgt" >&2; \
+	done
 	@# --- CodeBuddy ---
 	@find $(HOME)/.codebuddy/projects -name '*.jsonl' 2>/dev/null | while read src; do \
 		session=$$(basename "$$src" .jsonl); \
@@ -58,6 +70,18 @@ harvest:
 		mkdir -p $$(dirname "$$tgt"); \
 		$(CONVERTER) -f codex "$$src" "$$tgt.md" && \
 		$(CONVERTER) -f codex -t jsonl "$$src" "$$tgt.jsonl" && \
+		echo "OK $$tgt" >&2; \
+	done
+	@# --- Cursor Agent ---
+	@find $(HOME)/.cursor/projects -path '*/agent-transcripts/*' -name '*.jsonl' 2>/dev/null | while read src; do \
+		session=$$(basename "$$src" .jsonl); \
+		project=$$(echo "$$src" | sed 's|.*/projects/||' | cut -d/ -f1 | sed 's|^-\?[^-]*-home-[^-]*-project-\?||;s|^-||'); \
+		project=$${project:-project}; \
+		tgt=$(LOGS)/cursor/$$project/$$session; \
+		[ -f "$$tgt.jsonl" ] && [ "$$tgt.jsonl" -nt "$$src" ] && continue; \
+		mkdir -p $$(dirname "$$tgt"); \
+		$(CONVERTER) -f cursor "$$src" "$$tgt.md" && \
+		$(CONVERTER) -f cursor -t jsonl "$$src" "$$tgt.jsonl" && \
 		echo "OK $$tgt" >&2; \
 	done
 	@# --- Auto-sync: commit+push new harvested sessions to ai-memory ---

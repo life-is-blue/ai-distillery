@@ -76,10 +76,11 @@ Day 8: 新项目的 AI Agent 通过 git-library 读到这条 Gene → 主动遵�
 
 同时也是一把高效的日志格式转换工具：
 
-- **Claude Code**: 深度支持子智能体识别及 XML 标签剥离
+- **Claude Code**: 深度支持子智能体识别及 XML 标签剥离（含 tclaude 等同构 fork）
 - **Gemini**: `parts` 数组解析、工具调用、`thoughts` 提取
 - **CodeBuddy**: 内部文本块清理及函数调用标记
 - **OpenAI Codex**: `response_item` 负载结构精准提取
+- **Cursor Agent**: `agent-transcripts` 会话解析，剥离 `<timestamp>`/`<user_query>` 包装标签
 
 ```bash
 # 基础转换
@@ -93,7 +94,7 @@ python3 ai_log_converter.py --slop input.jsonl output.md
 ```
 
 ```
--f FORMAT          强制格式: claude | gemini | codebuddy | codex (默认: 自动检测)
+-f FORMAT          强制格式: claude | gemini | codebuddy | codex | cursor (默认: 自动检测)
 -t TYPE            输出: md | txt | jsonl (默认: md)
 --role ROLE        过滤: user | assistant | all (默认: all)
 --no-thoughts      去除推理/思考块

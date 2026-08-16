@@ -27,7 +27,7 @@ scripts/extract-gene.sh plan-before-act
 ## Converter Flags
 
 ```
--f FORMAT          Force: claude | gemini | codebuddy | codex (default: auto-detect)
+-f FORMAT          Force: claude | gemini | codebuddy | codex | cursor (default: auto-detect)
 -t TYPE            Output: md | txt | jsonl (default: md)
 --role ROLE        Filter: user | assistant | all (default: all)
 --no-thoughts      Strip reasoning/thinking blocks
@@ -38,7 +38,7 @@ scripts/extract-gene.sh plan-before-act
 
 | Target | What it does |
 |--------|-------------|
-| `make harvest` | Convert sessions from ~/.gemini, ~/.claude-internal, ~/.codebuddy, ~/.codex → ai-memory/ |
+| `make harvest` | Convert sessions from ~/.gemini, ~/.claude-internal, ~/.tclaude, ~/.codebuddy, ~/.codex, ~/.cursor → ai-memory/ |
 | `make report` | Generate yesterday's daily report |
 | `make push` | Push latest report to WeCom webhook |
 | `make soul` | Full-context SOUL.md observation extraction (4 categories: Identity/Preferences/Patterns/Context) |

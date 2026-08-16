@@ -48,6 +48,15 @@ class TestAiLogConverter(unittest.TestCase):
         self.assertIn("### User", output)
         self.assertIn("### Assistant", output)
 
+    def test_cursor_conversion(self):
+        input_file = self.DATA_DIR / "cursor_masked.jsonl"
+        output = self.run_convert(input_file)
+        self.assertIn("### User", output)
+        self.assertIn("### Assistant", output)
+        self.assertIn("Tool Call: `Shell`", output)
+        self.assertNotIn("<user_query>", output)
+        self.assertNotIn("<timestamp>", output)
+
     def test_detect_format_skips_initial_metadata_lines(self):
         with tempfile.NamedTemporaryFile("w+", suffix=".jsonl", delete=False) as tf:
             tf.write('{"type":"info","msg":"meta"}\n')
