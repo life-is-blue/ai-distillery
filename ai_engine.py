@@ -101,25 +101,32 @@ def _codex_available() -> bool:
 # Unified entry point
 # ---------------------------------------------------------------------------
 
-def call_engine(content: str, system: str, max_tokens: int = 4000) -> str:
+def call_engine(content: str, system: str, max_tokens: int = 4000, allow_chunking: bool = True) -> str:
     """Unified LLM call. All cmd_* functions use this and only this.
 
     Strategy:
       1. codex exec available? → 128K context, single call, full content
       2. fallback → call_llm with auto-batching for small-context models
+
+    allow_chunking=False disables the auto-batch split-and-join fallback below.
+    Only safe to leave True for prompts that extract independent per-chunk items
+    (e.g. bullet extraction) — chunk outputs are validly concatenable. Prompts
+    that ask the LLM to produce ONE complete, non-repeating document (e.g. a
+    holistic rewrite/persona synthesis) MUST pass allow_chunking=False, or a
+    chunked call produces N complete-but-conflicting documents joined together.
     """
     if _codex_available():
         result = _call_codex(content, system)
         if result:
             return result
         print("codex exec failed, falling back to call_llm", file=sys.stderr)
-    return _call_llm_auto(content, system, max_tokens)
+    return _call_llm_auto(content, system, max_tokens, allow_chunking)
 
 
-def _call_llm_auto(content: str, system: str, max_tokens: int) -> str:
+def _call_llm_auto(content: str, system: str, max_tokens: int, allow_chunking: bool = True) -> str:
     """call_llm with auto-batching for small-context models (e.g. glm-5.1 ~8K tokens)."""
     MAX_PROMPT_CHARS = 6000  # safe for glm-5.1: ~3K tokens content + system overhead
-    if len(content) + len(system) < MAX_PROMPT_CHARS:
+    if len(content) + len(system) < MAX_PROMPT_CHARS or not allow_chunking:
         return call_llm(content, system, max_tokens)
 
     # Split by natural section breaks (---), accumulate chunks under budget

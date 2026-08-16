@@ -20,7 +20,7 @@ Config via .env (auto-loaded):
   WECOM_WEBHOOK_URL     WeCom group robot webhook (optional, for push)
   AI_LOGS_DIR           Memory directory (default: ./ai-memory)
 """
-import argparse, json, os, re, subprocess, sys
+import argparse, hashlib, json, os, re, subprocess, sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -30,7 +30,7 @@ from ai_engine import load_dotenv, call_engine, _codex_available
 from ai_prompts import (
     REPORT_SYSTEM, SOUL_SYSTEM, DISTILL_SYSTEM, GROUNDING_SYSTEM,
     LESSONS_SYSTEM, SOUL_SKELETON, LESSONS_SKELETON, MEMORY_SKELETON,
-    DREAM_SYSTEM, MEMORY_DREAM_SYSTEM, AGENTS_SYSTEM, GENE_REVIEW_SYSTEM,
+    SOUL_DEDUP_SYSTEM, MEMORY_DEDUP_SYSTEM, AGENTS_SYSTEM, GENE_REVIEW_SYSTEM,
 )
 
 
@@ -452,6 +452,46 @@ def _grounding_check_legacy(observations: str, user_turns: str) -> str:
     return "\n".join(kept)
 
 
+def priority_gate(observations: str) -> str:
+    """Mechanically drop Preferences/Patterns/Context entries tagged priority<50.
+
+    Identity entries pass through untouched (not priority-scored). Entries
+    missing a priority tag also pass through (legacy/lenient default).
+    Operates on the same ## section-header structure grounding_check produces.
+    """
+    if "## " not in observations:
+        return observations
+    SECTION_ORDER = ("Identity", "Preferences", "Patterns", "Context")
+    sections = _parse_soul_sections(observations)
+    priority_re = re.compile(r'<!--\s*priority:\s*(\d+)\s*-->')
+
+    output_sections: dict[str, list[str]] = {s: [] for s in SECTION_ORDER}
+    dropped = 0
+    for section in SECTION_ORDER:
+        for entry in sections.get(section, []):
+            if section != "Identity":
+                m = priority_re.search(entry)
+                if m and int(m.group(1)) < 50:
+                    dropped += 1
+                    continue
+            output_sections[section].append(entry)
+
+    if dropped:
+        print(f"Priority gate: dropped {dropped} entries (priority<50)", file=sys.stderr)
+
+    parts: list[str] = []
+    for section in SECTION_ORDER:
+        entries = output_sections[section]
+        if not entries:
+            continue
+        parts.append(f"## {section}")
+        for entry in entries:
+            parts.append(entry)
+        parts.append("")
+
+    return "\n".join(parts).strip()
+
+
 def observe_with_chunking(chunks: list[str]) -> str:
     """LLM observe — call_engine handles context limits internally."""
     combined = "\n\n---\n\n".join(chunks)
@@ -509,6 +549,11 @@ def lessons_quality_gate(entries: list[dict]) -> list[dict]:
         text = entry["text"]
         if any(re.search(p, text) for p in REJECT_PATTERNS):
             print(f"Lessons quality gate rejected: {entry['slug']}", file=sys.stderr)
+            continue
+        # Mechanical priority cutoff (missing tag = keep, lenient default)
+        pri_m = re.search(r'\|\s*priority:\s*(\d+)', text)
+        if pri_m and int(pri_m.group(1)) < 50:
+            print(f"Lessons quality gate rejected (priority<50): {entry['slug']}", file=sys.stderr)
             continue
         # correction without 因 is noise — root cause is the core value of a correction
         if 'type: correction' in text:
@@ -657,6 +702,9 @@ def cmd_soul(args):
         observations = grounding_check(observations, user_turns_text)
         if not observations:
             print(f"Observations for {target_date} rejected by grounding check", file=sys.stderr); return
+        observations = priority_gate(observations)
+        if not observations:
+            print(f"Observations for {target_date} rejected by priority gate", file=sys.stderr); return
         entry_date = target_date
     else:
         # Existing batch mode (unchanged logic)
@@ -694,6 +742,9 @@ def cmd_soul(args):
         observations = grounding_check(observations, user_turns_text)
         if not observations:
             print("Observations rejected by grounding check", file=sys.stderr); return
+        observations = priority_gate(observations)
+        if not observations:
+            print("Observations rejected by priority gate", file=sys.stderr); return
         entry_date = today
 
     # Count actual jsonl files on disk
@@ -1683,8 +1734,187 @@ def _mark_absorbed_soul_entries(soul_path: Path, entry_texts: list[str]) -> None
 
 # ── cmd_dream: LLM-powered semantic consolidation ────────────────────────
 
+def _strip_lifecycle_tags(text: str) -> str:
+    """Remove id/new/absorbed HTML-comment tags (dream reassigns these on write)."""
+    text = re.sub(r'\s*<!--\s*id:\s*[0-9a-f]+\s*-->', '', text)
+    text = re.sub(r'\s*<!--\s*new:\s*\d{4}-\d{2}-\d{2}\s*-->', '', text)
+    text = re.sub(r'\s*<!--\s*absorbed:\s*[^>]*?-->', '', text)
+    return text
+
+
+_ID_TAG_RE = re.compile(r'<!--\s*id:\s*([0-9a-f]{8})\s*-->')
+
+
+def _entry_id(text: str) -> str:
+    """Deterministic 8-hex-char id from an entry's content (sans lifecycle tags),
+    so the same semantic entry always gets the same id across dream runs."""
+    return hashlib.sha1(_strip_lifecycle_tags(text).strip().encode("utf-8")).hexdigest()[:8]
+
+
+def _ensure_entry_id(entry: str) -> tuple[str, str]:
+    """Return (id, entry_with_id_tag_on_first_line). Reuses an existing id tag if present."""
+    m = _ID_TAG_RE.search(entry)
+    if m:
+        return m.group(1), entry
+    eid = _entry_id(entry)
+    lines = entry.split("\n")
+    lines[0] = lines[0].rstrip() + f" <!-- id: {eid} -->"
+    return eid, "\n".join(lines)
+
+
+def _call_json_engine(payload: dict, system: str) -> list | None:
+    """call_engine expecting a strict JSON array response.
+
+    Always allow_chunking=False: candidate pools here are small (tens of
+    entries, well under the char budget in practice), and a JSON array is a
+    single logical unit — splitting the call would produce N independent
+    arrays with no way to merge them meaningfully. Returns None (not []) on
+    any failure so callers can distinguish "nothing to change" from "could
+    not get a trustworthy answer, leave the file alone".
+    """
+    raw = call_engine(json.dumps(payload, ensure_ascii=False), system, allow_chunking=False)
+    if not raw:
+        return None
+    raw = re.sub(r'^```(?:json)?\s*|\s*```\s*$', '', raw.strip())
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"Dream: JSON parse failed: {e}", file=sys.stderr)
+        return None
+    if not isinstance(data, list):
+        print("Dream: JSON response is not a list, ignoring", file=sys.stderr)
+        return None
+    return data
+
+
+def _apply_dedup_ops(id_map: dict[str, str], ops: list, unabsorbed_ids: set[str]) -> list[str]:
+    """Apply validated remove/merge ops to an {id: tagged_entry_text} pool.
+
+    Returns the final entry list (survivors + newly merged entries).
+    Malformed ops (unknown id, id claimed by >1 op, missing content) are
+    skipped with a stderr note rather than raising — LLM output is untrusted
+    and a bad op must never take down the whole consolidation pass.
+    """
+    removed: set[str] = set()
+    claimed: set[str] = set()
+    merged_new: list[str] = []
+    for op in ops:
+        if not isinstance(op, dict):
+            continue
+        action = op.get("op")
+        ids = [i for i in op.get("ids", []) if isinstance(i, str) and i in id_map and i not in claimed]
+        if not ids:
+            continue
+        if action == "remove":
+            removed.update(ids)
+            claimed.update(ids)
+        elif action == "merge":
+            content = (op.get("content") or "").strip()
+            if not content:
+                print("Dream: merge op missing content, skipping", file=sys.stderr)
+                continue
+            removed.update(ids)
+            claimed.update(ids)
+            content = _strip_lifecycle_tags(content).strip()
+            eid = _entry_id(content)
+            lines = content.split("\n")
+            tag = f" <!-- id: {eid} -->"
+            if any(i in unabsorbed_ids for i in ids):
+                tag += f" <!-- new: {date.today()} -->"
+            lines[0] = lines[0].rstrip() + tag
+            merged_new.append("\n".join(lines))
+        else:
+            print(f"Dream: unknown op '{action}', skipping", file=sys.stderr)
+
+    survivors = [text for eid, text in id_map.items() if eid not in removed]
+    return survivors + merged_new
+
+
+def _dedup_pool(pool_entries: list[str], payload_extra: dict, system: str) -> list[str]:
+    """Structured LLM dedup for one candidate pool (list of raw entry strings).
+
+    Replaces the old whole-file-rewrite approach: the LLM never sees or
+    produces a complete document, only per-entry remove/merge decisions
+    against a small pool. A malformed/empty response leaves the pool
+    untouched (ids get assigned regardless, so future runs converge) instead
+    of silently destroying entries it never had a chance to consider.
+    """
+    if len(pool_entries) < 2:
+        return pool_entries
+    id_map: dict[str, str] = {}
+    unabsorbed: set[str] = set()
+    pool = []
+    for entry in pool_entries:
+        eid, tagged = _ensure_entry_id(entry)
+        id_map[eid] = tagged
+        if "<!-- new:" in tagged:
+            unabsorbed.add(eid)
+        pool.append({"id": eid, "content": _strip_lifecycle_tags(tagged).strip()})
+
+    payload = {**payload_extra, "entries": pool}
+    ops = _call_json_engine(payload, system)
+    if ops is None:
+        print("Dream: dedup call failed, pool left unchanged (ids assigned)", file=sys.stderr)
+        return list(id_map.values())
+    if not ops:
+        return list(id_map.values())
+    return _apply_dedup_ops(id_map, ops, unabsorbed)
+
+
+_MEMORY_SECTIONS = ("MUST", "MUST NOT", "PREFER", "CONTEXT")
+
+
+def _parse_memory_layers(content: str) -> dict[str, dict[str, list[str]]]:
+    """Parse MEMORY.md into {section: {"Universal": [...], "Project-specific": [...]}}.
+
+    Tolerates the flat legacy format (no ### sub-headers) by treating the
+    whole section body as Universal, and a missing section entirely as empty
+    (rather than raising) — this is also how a partially-corrupted MEMORY.md
+    degrades gracefully instead of crashing the pipeline.
+    """
+    result: dict[str, dict[str, list[str]]] = {}
+    for section in _MEMORY_SECTIONS:
+        pattern = rf'^## {re.escape(section)}\s*\n(.*?)(?=^## |\Z)'
+        m = re.search(pattern, content, re.S | re.M)
+        body = m.group(1) if m else ""
+        layers = {"Universal": [], "Project-specific": []}
+        if "### Universal" in body or "### Project-specific" in body:
+            for layer in ("Universal", "Project-specific"):
+                sub_pattern = rf'^### {re.escape(layer)}[^\n]*\n(.*?)(?=^### |\Z)'
+                sm = re.search(sub_pattern, body, re.S | re.M)
+                if sm:
+                    layers[layer] = [l.strip() for l in sm.group(1).splitlines() if l.strip().startswith("- ")]
+        else:
+            layers["Universal"] = [l.strip() for l in body.splitlines() if l.strip().startswith("- ")]
+        result[section] = layers
+    return result
+
+
+def _rebuild_memory(header: str, layers: dict[str, dict[str, list[str]]]) -> str:
+    """Rebuild MEMORY.md: given header text (metadata block only) and the
+    4-section Universal/Project-specific layer dict, emit the full file."""
+    result = header.rstrip("\n") + "\n"
+    for section in _MEMORY_SECTIONS:
+        result += f"\n## {section}\n\n### Universal\n"
+        for e in layers[section]["Universal"]:
+            result += e.rstrip("\n") + "\n"
+        result += "\n### Project-specific (ai-distillery)\n"
+        for e in layers[section]["Project-specific"]:
+            result += e.rstrip("\n") + "\n"
+    return result
+
+
 def cmd_dream(args):
-    """Consolidate SOUL.md + MEMORY.md via LLM semantic merge."""
+    """Consolidate SOUL.md + MEMORY.md via structured, ID-based LLM dedup.
+
+    Each candidate pool (one SOUL section, or one MEMORY section+layer) gets
+    a batch remove/merge JSON decision from the LLM — never a whole-file
+    rewrite. This means a malformed/truncated/partial LLM response can only
+    ever leave one small pool unchanged; it can no longer silently delete
+    sections it was never asked about (see 2026-05-11 MEMORY.md incident:
+    a truncated whole-file rewrite dropped MUST NOT/PREFER/CONTEXT entirely
+    and passed validation because the check only looked for "## MUST").
+    """
     soul_path = Path(args.soul)
     memory_path = Path(args.memory)
     logs_dir = Path(args.logs)
@@ -1692,95 +1922,103 @@ def cmd_dream(args):
     # --- SOUL consolidation ---
     if soul_path.exists():
         soul_content = soul_path.read_text(encoding="utf-8")
-        entry_count = len(re.findall(r"^- ", soul_content, re.M))
-        has_unabsorbed = "<!-- new:" in soul_content
-        if entry_count <= 20 or not has_unabsorbed:
-            reason = f"{entry_count} entries (≤20)" if entry_count <= 20 else "no unabsorbed entries"
-            print(f"Dream: SOUL {reason}, skipping", file=sys.stderr)
+        sections = _parse_soul_sections(soul_content)
+        entry_count = sum(len(v) for v in sections.values())
+        if entry_count <= 20:
+            print(f"Dream: SOUL {entry_count} entries (≤20), skipping", file=sys.stderr)
         else:
-            print(f"Dream: consolidating SOUL.md ({entry_count} entries)...", file=sys.stderr)
-            body_match = re.search(r"^---\s*\n(.+)", soul_content, re.S | re.M)
-            body = body_match.group(1) if body_match else soul_content
+            print(f"Dream: consolidating SOUL.md ({entry_count} entries) via structured dedup...", file=sys.stderr)
+            new_sections = dict(sections)
+            for section in ("Preferences", "Patterns", "Context"):
+                before = sections.get(section, [])
+                after = _dedup_pool(before, {"section": section}, SOUL_DEDUP_SYSTEM)
+                new_sections[section] = after
+                if len(after) != len(before):
+                    print(f"Dream: SOUL.{section} {len(before)} → {len(after)} entries", file=sys.stderr)
+            # Identity: mechanical cap only (low volume, not worth an LLM call)
+            if len(new_sections.get("Identity", [])) > 3:
+                new_sections["Identity"] = new_sections["Identity"][-3:]
 
-            consolidated = call_engine(body, DREAM_SYSTEM)
-            if consolidated and "## Identity" in consolidated:
-                file_count = sum(
-                    1 for _ in logs_dir.rglob("*.jsonl") if "reports" not in _.parts
-                )
-                header = SOUL_SKELETON.format(date=date.today(), count=file_count)
-                new_content = header + "\n" + consolidated.strip() + "\n"
-                soul_path.write_text(new_content, encoding="utf-8")
-                new_count = len(re.findall(r"^- ", new_content, re.M))
-                print(
-                    f"Dream: SOUL consolidated {entry_count} → {new_count} entries",
-                    file=sys.stderr,
-                )
-            else:
-                print("Dream: LLM returned invalid output, skipping SOUL", file=sys.stderr)
+            file_count = sum(1 for _ in logs_dir.rglob("*.jsonl") if "reports" not in _.parts)
+            updated_header = re.sub(r"Sessions:.*", f"Sessions: {file_count} files", soul_content)
+            updated_header = re.sub(r"Last updated:.*", f"Last updated: {date.today()}", updated_header)
+            new_content = _rebuild_soul(updated_header, new_sections)
+            soul_path.write_text(new_content, encoding="utf-8")
+            new_total = sum(len(v) for v in new_sections.values())
+            print(f"Dream: SOUL consolidated {entry_count} → {new_total} entries", file=sys.stderr)
     else:
         print("Dream: SOUL.md not found, skipping", file=sys.stderr)
 
     # --- MEMORY consolidation ---
     if memory_path.exists():
         mem_content = memory_path.read_text(encoding="utf-8")
-        rule_count = len(re.findall(r"^- ", mem_content, re.M))
-        has_universal = "### Universal" in mem_content
-        if rule_count <= 60 and has_universal:
-            print(f"Dream: MEMORY has {rule_count} rules (≤60) with Universal layering, skipping", file=sys.stderr)
+        layers = _parse_memory_layers(mem_content)
+        rule_count = sum(len(l["Universal"]) + len(l["Project-specific"]) for l in layers.values())
+        if rule_count <= 60:
+            print(f"Dream: MEMORY has {rule_count} rules (≤60), skipping", file=sys.stderr)
         else:
-            reason = "missing Universal layering" if not has_universal else f"{rule_count} rules"
-            print(f"Dream: consolidating MEMORY.md ({reason})...", file=sys.stderr)
-            consolidated = call_engine(mem_content, MEMORY_DREAM_SYSTEM)
-            if consolidated and "## MUST" in consolidated:
-                version_m = re.search(r"Version: (\d+)", mem_content)
-                version = int(version_m.group(1)) + 1 if version_m else 1
-                header = (
-                    f"# MEMORY.md — Behavioral Rules\n"
-                    f"> Source: SOUL.md + dream | Updated: {date.today()} | "
-                    f"Version: {version} (dream-consolidated)\n"
-                    f"> Precedence: explicit user instruction > MEMORY.md > project CLAUDE.md\n\n"
-                )
-                new_content = header + consolidated.strip() + "\n"
-                memory_path.write_text(new_content, encoding="utf-8")
-                new_count = len(re.findall(r"^- ", new_content, re.M))
-                print(
-                    f"Dream: MEMORY consolidated {rule_count} → {new_count} rules",
-                    file=sys.stderr,
-                )
-            else:
-                print("Dream: LLM returned invalid output, skipping MEMORY", file=sys.stderr)
+            print(f"Dream: consolidating MEMORY.md ({rule_count} rules) via structured dedup...", file=sys.stderr)
+            new_layers = {s: dict(l) for s, l in layers.items()}
+            for section in _MEMORY_SECTIONS:
+                for layer_name in ("Universal", "Project-specific"):
+                    before = layers[section][layer_name]
+                    after = _dedup_pool(before, {"section": section, "layer": layer_name}, MEMORY_DEDUP_SYSTEM)
+                    new_layers[section][layer_name] = after
+                    if len(after) != len(before):
+                        print(f"Dream: MEMORY.{section}.{layer_name} {len(before)} → {len(after)} rules", file=sys.stderr)
+
+            version_m = re.search(r"Version: (\d+)", mem_content)
+            version = int(version_m.group(1)) + 1 if version_m else 1
+            header = (
+                f"# MEMORY.md — Behavioral Rules\n"
+                f"> Source: SOUL.md + dream | Updated: {date.today()} | "
+                f"Version: {version} (dream-consolidated)\n"
+                f"> Precedence: explicit user instruction > MEMORY.md > project CLAUDE.md\n\n"
+            )
+            new_content = _rebuild_memory(header, new_layers)
+            memory_path.write_text(new_content, encoding="utf-8")
+            new_total = sum(len(l["Universal"]) + len(l["Project-specific"]) for l in new_layers.values())
+            print(f"Dream: MEMORY consolidated {rule_count} → {new_total} rules", file=sys.stderr)
     else:
         print("Dream: MEMORY.md not found, skipping", file=sys.stderr)
 
-    # --- Phase 3: Generate AGENTS.md from SOUL + MEMORY.Universal ---
+    # --- Generate AGENTS.md from SOUL + MEMORY.Universal ---
+    # Holistic narrative synthesis (like TencentDB's L3 persona doc) — this one
+    # is NOT a structured diff, by design (same as their persona-generation
+    # prompt). It must never be chunked: allow_chunking=False, plus a
+    # duplicate-document guard as a second line of defense (see the 2026-05-09
+    # incident where a chunked call produced two complete AGENTS.md docs
+    # concatenated together).
     if soul_path.exists() and memory_path.exists():
         soul_body_match = re.search(r'^---\s*\n(.+)', soul_path.read_text(), re.S | re.M)
         soul_body = soul_body_match.group(1) if soul_body_match else ""
 
         mem_content = memory_path.read_text()
-        # Extract only Universal sub-blocks from each section
         universal_blocks = []
-        for section in ["MUST", "MUST NOT", "PREFER", "CONTEXT"]:
-            # Find ## SECTION then ### Universal block
+        for section in _MEMORY_SECTIONS:
             pattern = rf'^## {re.escape(section)}\s*\n(.*?)(?=^## |\Z)'
             m = re.search(pattern, mem_content, re.S | re.M)
             if not m:
                 continue
             section_body = m.group(1)
-            # Extract ### Universal block
             uni_m = re.search(r'### Universal[^\n]*\n(.*?)(?=^### |\Z)', section_body, re.S | re.M)
-            if uni_m:
+            if uni_m and uni_m.group(1).strip():
                 universal_blocks.append(f"## {section}\n{uni_m.group(1).strip()}")
 
         if soul_body and universal_blocks:
             combined = soul_body + "\n\n---\n\n# MEMORY (Universal only)\n\n" + "\n\n".join(universal_blocks)
             print("Dream: generating AGENTS.md from SOUL + MEMORY.Universal...", file=sys.stderr)
-            agents_content = call_engine(combined, AGENTS_SYSTEM)
-            if agents_content and agents_content.strip().startswith("#"):
+            agents_content = call_engine(combined, AGENTS_SYSTEM, allow_chunking=False)
+            header_hits = len(re.findall(r'^# AGENTS\.md', agents_content, re.M)) if agents_content else 0
+            if agents_content and agents_content.strip().startswith("#") and header_hits <= 1:
                 agents_path = soul_path.parent / "AGENTS.md"
                 agents_path.write_text(agents_content.strip() + "\n", encoding="utf-8")
                 lines = len(agents_content.splitlines())
-                print(f"Dream: AGENTS.md generated ({lines} lines)", file=sys.stderr)
+                chars = len(agents_content)
+                over_budget = " [OVER 6000-char budget]" if chars > 6000 else ""
+                print(f"Dream: AGENTS.md generated ({lines} lines, {chars} chars){over_budget}", file=sys.stderr)
+            elif header_hits > 1:
+                print(f"Dream: LLM returned {header_hits} concatenated AGENTS.md documents, rejecting write", file=sys.stderr)
             else:
                 print("Dream: LLM returned invalid AGENTS.md, skipping", file=sys.stderr)
 

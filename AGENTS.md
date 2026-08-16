@@ -42,7 +42,7 @@ scripts/extract-gene.sh plan-before-act
 | `make report` | Generate yesterday's daily report |
 | `make push` | Push latest report to WeCom webhook |
 | `make soul` | Full-context SOUL.md observation extraction (4 categories: Identity/Preferences/Patterns/Context) |
-| `make dream` | Consolidate SOUL.md: mechanical dedup + prune (no LLM) |
+| `make dream` | Consolidate SOUL.md + MEMORY.md: structured ID-based LLM dedup (candidate-pool remove/merge decisions) + regenerate AGENTS.md |
 | `make distill` | Distill SOUL.md + LESSONS.md → MEMORY.md rules (structured diff, ≥7 entries threshold) |
 | `make lessons` | Extract lessons learned → LESSONS.md (5 types: trap/toolchain/arch/correction/method) |
 | `make gene-health` | Compute Gene freshness, rebuild registry, output health report |
@@ -88,7 +88,7 @@ WECOM_WEBHOOK_URL=https://...    # optional, for push
 - `report [--date YYYY-MM-DD]` — daily work report with precise stats → `ai-memory/reports/{date}.md`
 - `push [--logs DIR]` — post latest report to WeCom group (silent if no webhook)
 - `soul [--date YYYY-MM-DD] [--since YYYY-MM-DD]` — full-context observation extraction to SOUL.md (4 categories: Identity/Preferences/Patterns/Context, quality-gated + entry-level grounding)
-- `dream [--soul FILE]` — consolidate SOUL.md: mechanical dedup (Jaccard/pk/prefix), enforce entry limits, no LLM
+- `dream [--soul FILE] [--memory FILE]` — consolidate SOUL.md + MEMORY.md via structured ID-based LLM dedup (per-section/layer candidate pool → remove/merge JSON decisions, never a whole-file rewrite), regenerate AGENTS.md from the result
 - `distill [--force] [--soul FILE] [--memory FILE] [--lessons FILE]` — distill SOUL.md + LESSONS.md → MEMORY.md rules (structured diff, Gene promotion suggestions)
 - `lessons [--date YYYY-MM-DD] [--lessons FILE]` — extract lessons learned → LESSONS.md (错题本: 坑/因/法 + area tags)
 - `gene-health [--genes-dir DIR]` — compute Gene freshness (decay model), rebuild registry.json, output health report

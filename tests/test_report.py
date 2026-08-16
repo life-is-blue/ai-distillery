@@ -32,6 +32,12 @@ from ai_report import (
     append_skip,
     read_and_clear_skip_buffer,
     _parse_skipped_section,
+    priority_gate,
+    _entry_id,
+    _ensure_entry_id,
+    _apply_dedup_ops,
+    _parse_memory_layers,
+    _rebuild_memory,
 )
 from ai_prompts import MEMORY_SKELETON
 
@@ -662,6 +668,160 @@ class TestGeneReviewParse(unittest.TestCase):
                     pass
         self.assertEqual(len(decisions), 1)
         self.assertEqual(decisions[0]["pk"], "x")
+
+
+class TestPriorityGate(unittest.TestCase):
+    """Mechanical priority<50 cutoff — drops low-signal SOUL entries without
+    relying on the LLM to self-restrain."""
+
+    def test_drops_low_priority_preferences(self):
+        obs = (
+            "## Preferences\n"
+            "- PREFER a / REJECT b <!-- priority: 90 -->\n"
+            "  Why: strong reason\n"
+            "  How: do this\n"
+            "- PREFER c / REJECT d <!-- priority: 30 -->\n"
+            "  Why: weak reason\n"
+            "  How: do that\n"
+        )
+        result = priority_gate(obs)
+        self.assertIn("PREFER a", result)
+        self.assertNotIn("PREFER c", result)
+
+    def test_keeps_identity_regardless_of_priority(self):
+        obs = "## Identity\n- some identity fact\n"
+        result = priority_gate(obs)
+        self.assertIn("some identity fact", result)
+
+    def test_missing_priority_tag_defaults_to_keep(self):
+        obs = "## Context\n- untagged fact (since 2026-01-01)\n"
+        result = priority_gate(obs)
+        self.assertIn("untagged fact", result)
+
+    def test_no_section_headers_passes_through(self):
+        obs = "NONE"
+        self.assertEqual(priority_gate(obs), "NONE")
+
+
+class TestEntryId(unittest.TestCase):
+    """Stable content-hash ids used by the structured dream dedup."""
+
+    def test_id_stable_across_lifecycle_tag_changes(self):
+        e1 = "- PREFER foo <!-- new: 2026-08-01 -->"
+        e2 = "- PREFER foo <!-- absorbed: 2026-08-10 -->"
+        self.assertEqual(_entry_id(e1), _entry_id(e2))
+
+    def test_ensure_entry_id_assigns_and_reuses(self):
+        eid, tagged = _ensure_entry_id("- PREFER bar")
+        self.assertIn("<!-- id:", tagged)
+        eid2, tagged2 = _ensure_entry_id(tagged)
+        self.assertEqual(eid, eid2)
+        self.assertEqual(tagged, tagged2)
+
+    def test_different_content_different_id(self):
+        _, t1 = _ensure_entry_id("- PREFER foo")
+        _, t2 = _ensure_entry_id("- PREFER bar")
+        self.assertNotEqual(_entry_id(t1), _entry_id(t2))
+
+
+class TestApplyDedupOps(unittest.TestCase):
+    """Structured remove/merge decision application — the core of the
+    ID-based dream refactor. LLM output here is untrusted input."""
+
+    def _pool(self, entries):
+        id_map = {}
+        for e in entries:
+            eid, tagged = _ensure_entry_id(e)
+            id_map[eid] = tagged
+        return id_map
+
+    def test_remove_drops_entry(self):
+        id_map = self._pool(["- A entry", "- B entry"])
+        target = next(iter(id_map))
+        result = _apply_dedup_ops(id_map, [{"op": "remove", "ids": [target]}], set())
+        self.assertEqual(len(result), 1)
+
+    def test_merge_replaces_two_with_one(self):
+        id_map = self._pool(["- A entry", "- B entry", "- C entry"])
+        ids = list(id_map)
+        ops = [{"op": "merge", "ids": [ids[0], ids[1]], "content": "- merged A+B"}]
+        result = _apply_dedup_ops(id_map, ops, set())
+        self.assertEqual(len(result), 2)
+        self.assertTrue(any("merged A+B" in r for r in result))
+        self.assertTrue(any("C entry" in r for r in result))
+
+    def test_merge_preserves_new_tag_if_any_source_unabsorbed(self):
+        id_map = self._pool(["- A entry", "- B entry"])
+        ids = list(id_map)
+        result = _apply_dedup_ops(
+            id_map, [{"op": "merge", "ids": ids, "content": "- merged"}], {ids[0]}
+        )
+        self.assertTrue(any("<!-- new:" in r for r in result))
+
+    def test_unknown_id_in_op_is_ignored(self):
+        id_map = self._pool(["- A entry"])
+        result = _apply_dedup_ops(id_map, [{"op": "remove", "ids": ["deadbeef"]}], set())
+        self.assertEqual(len(result), 1)
+
+    def test_merge_without_content_is_ignored(self):
+        id_map = self._pool(["- A entry", "- B entry"])
+        ids = list(id_map)
+        result = _apply_dedup_ops(id_map, [{"op": "merge", "ids": ids, "content": ""}], set())
+        self.assertEqual(len(result), 2)
+
+    def test_unknown_op_is_ignored(self):
+        id_map = self._pool(["- A entry"])
+        result = _apply_dedup_ops(id_map, [{"op": "explode", "ids": list(id_map)}], set())
+        self.assertEqual(len(result), 1)
+
+    def test_double_claimed_id_second_op_ignored(self):
+        id_map = self._pool(["- A entry", "- B entry"])
+        ids = list(id_map)
+        ops = [
+            {"op": "remove", "ids": [ids[0]]},
+            {"op": "merge", "ids": [ids[0], ids[1]], "content": "- merged"},
+        ]
+        result = _apply_dedup_ops(id_map, ops, set())
+        # ids[0] already claimed by remove; the merge op still applies to the
+        # remaining unclaimed id (ids[1]) alone, producing one merged entry
+        self.assertEqual(len(result), 1)
+
+    def test_empty_ops_is_no_op(self):
+        id_map = self._pool(["- A entry", "- B entry"])
+        result = _apply_dedup_ops(id_map, [], set())
+        self.assertEqual(len(result), 2)
+
+
+class TestParseMemoryLayers(unittest.TestCase):
+    """MEMORY.md parsing must degrade gracefully on missing/malformed
+    sections instead of crashing — this is what makes the 2026-05-11-style
+    corruption (3 of 4 sections silently dropped) recoverable rather than
+    a hard failure."""
+
+    def test_tolerates_missing_sections(self):
+        broken = (
+            "# MEMORY.md\n\n"
+            "## MUST\n\n"
+            "### Universal\n- rule one\n- rule two\n\n"
+            "### Project-specific (ai-distillery)\n- proj rule\n"
+        )
+        layers = _parse_memory_layers(broken)
+        self.assertEqual(layers["MUST"]["Universal"], ["- rule one", "- rule two"])
+        self.assertEqual(layers["MUST"]["Project-specific"], ["- proj rule"])
+        self.assertEqual(layers["MUST NOT"]["Universal"], [])
+        self.assertEqual(layers["PREFER"]["Universal"], [])
+        self.assertEqual(layers["CONTEXT"]["Universal"], [])
+
+    def test_legacy_flat_format_treated_as_universal(self):
+        flat = "# MEMORY.md\n\n## MUST\n- flat rule one\n- flat rule two\n"
+        layers = _parse_memory_layers(flat)
+        self.assertEqual(layers["MUST"]["Universal"], ["- flat rule one", "- flat rule two"])
+
+    def test_rebuild_always_emits_all_four_sections(self):
+        layers = _parse_memory_layers("# MEMORY.md\n\n## MUST\n\n### Universal\n- x\n")
+        rebuilt = _rebuild_memory("# MEMORY.md\n", layers)
+        for section in ("MUST", "MUST NOT", "PREFER", "CONTEXT"):
+            self.assertIn(f"## {section}", rebuilt)
 
 
 if __name__ == "__main__":

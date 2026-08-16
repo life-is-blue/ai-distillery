@@ -46,7 +46,7 @@ harvest → report → push → soul → dream → lessons → distill → gene-
 | `report` | 日报：精确工具统计 + LLM 摘要 |
 | `push` | 推送日报到企业微信群 |
 | `soul` | 全量上下文（200K）行为观察提取，4 类分类（Identity/Preferences/Patterns/Context），Preferences 强制 Why+How |
-| `dream` | SOUL.md 机械整合：Jaccard 去重 + pk 合并 + 条目数限制裁剪（不调 LLM） |
+| `dream` | SOUL.md + MEMORY.md 结构化去重：按 section/layer 分候选池，LLM 输出 remove/merge JSON 决策（带稳定 id，从不整篇重写），再重新生成 AGENTS.md |
 | `lessons` | 经验教训提取：5 类（trap/toolchain/arch/correction/method），只留跨项目可迁移的错题本 |
 | `distill` | 蒸馏 SOUL + LESSONS → MEMORY.md 行为规则（MUST/MUST_NOT/PREFER/CONTEXT） |
 | `gene-health` | Gene 新鲜度衰减模型，registry 重建，晋升建议 |
