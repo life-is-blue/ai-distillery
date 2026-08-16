@@ -2097,12 +2097,14 @@ def _check_rule_freshness(memory_path: Path, soul_path: Path) -> list[tuple[str,
         if not line_s.startswith("- "):
             continue
         rule_text = line_s[2:].strip()
-        # Check if any recent pk keyword appears in rule text
+        # Check if any recent pk keyword appears in rule text as a whole word
+        # (plain substring matching false-positived "review" -> "reviewer",
+        # "commit" -> "Commits"; \b prevents matching inside a longer word)
         found = False
         for pk in recent_pks:
             # pk is kebab-case like "plan-before-act"; check each word
             for word in pk.split("-"):
-                if len(word) > 2 and word.lower() in rule_text.lower():
+                if len(word) > 2 and re.search(rf"\b{re.escape(word)}\b", rule_text, re.I):
                     found = True
                     break
             if found:

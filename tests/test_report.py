@@ -689,6 +689,27 @@ class TestCheckRuleFreshness(unittest.TestCase):
             results = dict(_check_rule_freshness(memory, soul))
             self.assertEqual(results["Plan before acting on ambiguous requests"], "stale")
 
+    def test_pk_word_requires_whole_word_match(self):
+        """Regression: plain substring matching false-positived pk word
+        'review' against 'reviewer' and 'commit' against 'Commits'."""
+        with tempfile.TemporaryDirectory() as d:
+            today = date.today().isoformat()
+            soul = self._write(d, "SOUL.md", (
+                "# SOUL.md\n\n## Identity\n\n## Preferences\n\n## Patterns\n\n"
+                f"- Reviews before commit | Evidence: x <!-- pk: review-before-commit --> <!-- new: {today} -->\n\n"
+                "## Context\n"
+            ))
+            memory = self._write(d, "MEMORY.md", (
+                "## MUST\n\n"
+                "- Writing pipeline: draft -> reviewer -> illustrator\n"
+                "- Use Conventional Commits format for messages\n"
+                "- Please commit small changes\n"
+            ))
+            results = dict(_check_rule_freshness(memory, soul))
+            self.assertEqual(results["Writing pipeline: draft -> reviewer -> illustrator"], "stale")
+            self.assertEqual(results["Use Conventional Commits format for messages"], "stale")
+            self.assertEqual(results["Please commit small changes"], "evidenced")
+
 
 class TestParseSkippedSection(unittest.TestCase):
     """Tests for _parse_skipped_section."""
