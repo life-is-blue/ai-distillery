@@ -169,6 +169,10 @@ def find_sessions(logs_dir: Path, target_date: date = None) -> list[Path]:
     for p in sorted(logs_dir.rglob("*.jsonl")):
         if "reports" in p.parts:
             continue
+        # Real sessions are always logs_dir/tool/project/session.jsonl (3 path parts).
+        # Root-level jsonl files (e.g. .skip-buffer.jsonl) aren't sessions.
+        if len(p.relative_to(logs_dir).parts) < 3:
+            continue
         if target_date and target_date not in session_days(p):
             continue
         results.append(p)
@@ -748,7 +752,7 @@ def cmd_soul(args):
         entry_date = today
 
     # Count actual jsonl files on disk
-    file_count = sum(1 for _ in logs_dir.rglob("*.jsonl") if "reports" not in _.parts)
+    file_count = len(find_sessions(logs_dir))
 
     if not soul_path.exists():
         soul_path.write_text(SOUL_SKELETON.format(date=entry_date, count=file_count), encoding="utf-8")
@@ -1630,7 +1634,8 @@ def _update_soul_section(
 
     before = soul_content[:insert_pos].rstrip("\n") + "\n"
     after = soul_content[insert_pos:]
-    return before + block + after
+    separator = "\n" if m_next else ""  # blank line before the next ## header, none at EOF
+    return before + block + separator + after
 
 
 def _merge_soul_entry(
@@ -1939,7 +1944,7 @@ def cmd_dream(args):
             if len(new_sections.get("Identity", [])) > 3:
                 new_sections["Identity"] = new_sections["Identity"][-3:]
 
-            file_count = sum(1 for _ in logs_dir.rglob("*.jsonl") if "reports" not in _.parts)
+            file_count = len(find_sessions(logs_dir))
             updated_header = re.sub(r"Sessions:.*", f"Sessions: {file_count} files", soul_content)
             updated_header = re.sub(r"Last updated:.*", f"Last updated: {date.today()}", updated_header)
             new_content = _rebuild_soul(updated_header, new_sections)

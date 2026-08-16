@@ -38,6 +38,7 @@ from ai_report import (
     _apply_dedup_ops,
     _parse_memory_layers,
     _rebuild_memory,
+    find_sessions,
 )
 from ai_prompts import MEMORY_SKELETON
 
@@ -468,6 +469,20 @@ class TestMergeSoulEntry(unittest.TestCase):
         entries = [l for l in ctx_m.group(1).splitlines() if l.strip().startswith("-")]
         self.assertEqual(len(entries), 2)
 
+    def test_appended_entry_leaves_blank_line_before_next_section(self):
+        """Regression: appending must not glue the last entry to the next ## header."""
+        soul = (
+            "# SOUL.md\n\n"
+            "## Identity\n\n"
+            "## Preferences\n\n"
+            "- PREFER streaming over batch\n\n"
+            "## Patterns\n\n"
+            "## Context\n"
+        )
+        new_obs = "## Preferences\n\n- PREFER small commits\n"
+        result = _merge_soul_entry(soul, new_obs, "2026-05-02")
+        self.assertIn("PREFER small commits <!-- new: 2026-05-02 -->\n\n## Patterns", result)
+
     def test_empty_soul_gets_skeleton(self):
         """Empty soul_content gets sections created automatically."""
         soul = "# SOUL.md\n\n"  # no sections at all
@@ -608,6 +623,31 @@ class TestSkipBuffer(unittest.TestCase):
             self.assertIn('gene', sources)
             # After clear
             self.assertEqual(read_and_clear_skip_buffer(logs), [])
+
+
+class TestFindSessions(unittest.TestCase):
+    """Regression: root-level jsonl files (e.g. .skip-buffer.jsonl) aren't sessions."""
+
+    def test_excludes_root_level_jsonl(self):
+        with tempfile.TemporaryDirectory() as d:
+            logs = Path(d)
+            (logs / ".skip-buffer.jsonl").write_text('{"source": "lessons"}\n')
+            (logs / "claude" / "myproject").mkdir(parents=True)
+            (logs / "claude" / "myproject" / "session1.jsonl").write_text('{}\n')
+            sessions = find_sessions(logs)
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(sessions[0].name, "session1.jsonl")
+
+    def test_excludes_reports_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            logs = Path(d)
+            (logs / "reports").mkdir()
+            (logs / "reports" / "2026-01-01.jsonl").write_text('{}\n')
+            (logs / "claude" / "myproject").mkdir(parents=True)
+            (logs / "claude" / "myproject" / "session1.jsonl").write_text('{}\n')
+            sessions = find_sessions(logs)
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(sessions[0].name, "session1.jsonl")
 
 
 class TestParseSkippedSection(unittest.TestCase):
