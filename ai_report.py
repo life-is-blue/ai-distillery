@@ -164,6 +164,11 @@ def session_days(path: Path) -> set[date]:
     return days
 
 
+def _report_month_dir(reports_dir: Path, d: date) -> Path:
+    """reports/ is partitioned reports/YYYY/MM/ to keep any one directory small."""
+    return reports_dir / f"{d:%Y}" / f"{d:%m}"
+
+
 def find_sessions(logs_dir: Path, target_date: date = None) -> list[Path]:
     results = []
     for p in sorted(logs_dir.rglob("*.jsonl")):
@@ -641,8 +646,9 @@ def cmd_report(args):
     target_date = args.date or (date.today() - timedelta(days=1))
     sessions = find_sessions(logs_dir, target_date)
     reports_dir = logs_dir / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    out_path = reports_dir / f"{target_date}.md"
+    month_dir = _report_month_dir(reports_dir, target_date)
+    month_dir.mkdir(parents=True, exist_ok=True)
+    out_path = month_dir / f"{target_date}.md"
     if not sessions:
         out_path.write_text(f"# {target_date}\n\n无 AI 会话记录。\n", encoding="utf-8")
         print(f"OK {out_path}", file=sys.stderr); return
@@ -1470,8 +1476,9 @@ def cmd_push(args):
         print("WECOM_WEBHOOK_URL not set, skip push", file=sys.stderr); return
     reports_dir = Path(args.logs) / "reports"
     # Find the most recently modified work report (YYYY-MM-DD.md only, exclude daily-health-*)
+    # reports/ is partitioned reports/YYYY/MM/, so recurse rather than glob one level.
     reports = sorted(
-        [p for p in reports_dir.glob("*.md") if re.match(r'\d{4}-\d{2}-\d{2}\.md$', p.name)],
+        [p for p in reports_dir.rglob("*.md") if re.match(r'\d{4}-\d{2}-\d{2}\.md$', p.name)],
         key=lambda p: p.stat().st_mtime, reverse=True
     )
     if not reports:
@@ -2122,8 +2129,9 @@ def cmd_daily(args):
     memory_path = logs_dir / "MEMORY.md"
     genes_dir = logs_dir / "genes"
     reports_dir = logs_dir / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    out_path = reports_dir / f"daily-health-{target_date}.md"
+    month_dir = _report_month_dir(reports_dir, target_date)
+    month_dir.mkdir(parents=True, exist_ok=True)
+    out_path = month_dir / f"daily-health-{target_date}.md"
 
     sections = []
     todos = []
@@ -2274,7 +2282,7 @@ def cmd_daily(args):
     for d in range(7):
         day = target_date - timedelta(days=d)
         n_sessions = len(find_sessions(logs_dir, day))
-        has_report = (reports_dir / f"{day}.md").exists()
+        has_report = (_report_month_dir(reports_dir, day) / f"{day}.md").exists()
         has_soul = f"<!-- new: {day} -->" in soul_content
         n_lessons = len(re.findall(rf'>\s*{day}\s*\|', lessons_content))
         s7.append(f"| {day} | {n_sessions} | {'✓' if has_report else '—'} | {'✓' if has_soul else '—'} | +{n_lessons} |")

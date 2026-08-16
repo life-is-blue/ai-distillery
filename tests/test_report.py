@@ -40,6 +40,7 @@ from ai_report import (
     _rebuild_memory,
     find_sessions,
     _check_rule_freshness,
+    _report_month_dir,
 )
 from ai_prompts import MEMORY_SKELETON
 
@@ -624,6 +625,18 @@ class TestSkipBuffer(unittest.TestCase):
             self.assertIn('gene', sources)
             # After clear
             self.assertEqual(read_and_clear_skip_buffer(logs), [])
+
+
+class TestReportMonthDir(unittest.TestCase):
+    """Tests for _report_month_dir (reports/YYYY/MM/ partitioning)."""
+
+    def test_single_digit_month_zero_padded(self):
+        d = _report_month_dir(Path("/x/reports"), date(2026, 3, 9))
+        self.assertEqual(d, Path("/x/reports/2026/03"))
+
+    def test_double_digit_month(self):
+        d = _report_month_dir(Path("/x/reports"), date(2026, 11, 1))
+        self.assertEqual(d, Path("/x/reports/2026/11"))
 
 
 class TestFindSessions(unittest.TestCase):
