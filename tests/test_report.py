@@ -39,6 +39,7 @@ from ai_report import (
     _parse_memory_layers,
     _rebuild_memory,
     find_sessions,
+    _check_rule_freshness,
 )
 from ai_prompts import MEMORY_SKELETON
 
@@ -648,6 +649,45 @@ class TestFindSessions(unittest.TestCase):
             sessions = find_sessions(logs)
             self.assertEqual(len(sessions), 1)
             self.assertEqual(sessions[0].name, "session1.jsonl")
+
+
+class TestCheckRuleFreshness(unittest.TestCase):
+    """Regression: freshness bridge must read the current 4-section SOUL.md
+    format (### date blocks no longer exist), via new:/absorbed: tags."""
+
+    def _write(self, d, name, content):
+        path = Path(d) / name
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def test_recent_pk_marks_matching_rule_evidenced(self):
+        with tempfile.TemporaryDirectory() as d:
+            today = date.today().isoformat()
+            soul = self._write(d, "SOUL.md", (
+                "# SOUL.md\n\n## Identity\n\n## Preferences\n\n## Patterns\n\n"
+                f"- Plans before acting | Evidence: x <!-- pk: plan-before-act --> <!-- new: {today} -->\n\n"
+                "## Context\n"
+            ))
+            memory = self._write(d, "MEMORY.md", (
+                "## MUST\n\n- Plan before acting on ambiguous requests\n"
+                "- Unrelated rule about something else\n"
+            ))
+            results = dict(_check_rule_freshness(memory, soul))
+            self.assertEqual(results["Plan before acting on ambiguous requests"], "evidenced")
+            self.assertEqual(results["Unrelated rule about something else"], "stale")
+
+    def test_old_pk_tag_does_not_count_as_recent(self):
+        with tempfile.TemporaryDirectory() as d:
+            soul = self._write(d, "SOUL.md", (
+                "# SOUL.md\n\n## Identity\n\n## Preferences\n\n## Patterns\n\n"
+                "- Plans before acting | Evidence: x <!-- pk: plan-before-act --> <!-- absorbed: 2020-01-01 -->\n\n"
+                "## Context\n"
+            ))
+            memory = self._write(d, "MEMORY.md", (
+                "## MUST\n\n- Plan before acting on ambiguous requests\n"
+            ))
+            results = dict(_check_rule_freshness(memory, soul))
+            self.assertEqual(results["Plan before acting on ambiguous requests"], "stale")
 
 
 class TestParseSkippedSection(unittest.TestCase):

@@ -2070,22 +2070,24 @@ def _check_rule_freshness(memory_path: Path, soul_path: Path) -> list[tuple[str,
     Uses pk tags as bridge. Returns [(rule_text, status)] where status is 'evidenced' or 'stale'."""
     if not memory_path.exists() or not soul_path.exists():
         return []
-    # Collect pk tags from recent 30 days in SOUL.md
+    # Collect pk tags from SOUL entries touched (new/absorbed) in the last 30 days.
+    # SOUL.md's current format is the 4-section Identity/Preferences/Patterns/Context
+    # layout (no per-date ### blocks), so entries are parsed via _parse_soul_sections
+    # and dated via their <!-- new: --> / <!-- absorbed: --> lifecycle tags.
     cutoff = date.today() - timedelta(days=30)
     soul_content = soul_path.read_text(encoding="utf-8")
     recent_pks = set()
-    entries = re.split(r'(?=\n### \d{4}-\d{2}-\d{2}\n)', soul_content)
-    for entry in entries:
-        m = re.match(r'\n### (\d{4}-\d{2}-\d{2})\n', entry)
-        if not m:
-            continue
-        try:
-            entry_date = date.fromisoformat(m.group(1))
-        except ValueError:
-            continue
-        if entry_date >= cutoff:
-            for pk_m in re.finditer(r'<!--\s*pk:\s*([\w-]+)\s*-->', entry):
-                recent_pks.add(pk_m.group(1))
+    for entries in _parse_soul_sections(soul_content).values():
+        for entry in entries:
+            entry_dates = []
+            for d in re.findall(r'<!--\s*(?:new|absorbed):\s*(\d{4}-\d{2}-\d{2})\s*-->', entry):
+                try:
+                    entry_dates.append(date.fromisoformat(d))
+                except ValueError:
+                    continue
+            if entry_dates and max(entry_dates) >= cutoff:
+                for pk_m in re.finditer(r'<!--\s*pk:\s*([\w-]+)\s*-->', entry):
+                    recent_pks.add(pk_m.group(1))
 
     # Check each rule against recent pks
     memory_content = memory_path.read_text(encoding="utf-8")
