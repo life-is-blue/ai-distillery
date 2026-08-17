@@ -23,6 +23,7 @@ from ai_report import (
     _msg_parts,
     _intervention_stats,
     _render_intervention_report,
+    _TAXONOMY,
     find_sessions,
 )
 
@@ -232,6 +233,104 @@ class TestAttribution(unittest.TestCase):
                 *_pad(30),
             ])
             self.assertEqual(scan_session_interventions(p, "claude")[0]["action"], "Read")
+
+
+class TestTaxonomy(unittest.TestCase):
+    """The hand-labelled taxonomy. Every case below is a verbatim directive from
+    the corpus, labelled by the user — these lock in HIS ruling, not my guess."""
+
+    def test_each_labelled_class(self):
+        cases = [
+            ("让 codex 评审方案,没问题再让 codex 负责实施吧,你来进行验收.", "delegate_directed"),
+            ("先规划, 谋定而后动.", "plan_first"),
+            ("我们不是导航优先吗,你真的理解项目的思想了吗", "plan_first"),
+            ("直接拉取这个仓库, 更简单", "simpler_path"),
+            ("不用这么麻烦, 告诉我协助处理效率高很多", "simpler_path"),
+            ("很好, 现在功能测试图片已经正常, 但是发现: 1.字体不清晰", "defect_report"),
+            ("方向 ok 了, 不过我还是希望文件命名尽量整齐对齐. 保持好品味,谢谢.", "defect_report"),
+            ("baoan 文件夹是另外一个项目的", "context_supplied"),
+            ("现在进度到哪里了", "progress_query"),
+        ]
+        for directive, expected in cases:
+            self.assertEqual(_classify_directive(directive), expected, directive)
+
+    def test_counted_vs_normal_collaboration(self):
+        # The user ruled progress_query and new_task normal collaboration.
+        # Counting them would turn "reduce interventions" into "make the user
+        # speak less", which is the wrong objective.
+        counted = {k for k, c, _ in _TAXONOMY if c}
+        not_counted = {k for k, c, _ in _TAXONOMY if not c}
+        self.assertIn("delegate_directed", counted)
+        self.assertIn("defect_report", counted)
+        self.assertIn("progress_query", not_counted)
+
+    def test_short_acknowledgements_are_noise(self):
+        for text in ("你好", "可以", "可以的.", "好的", "Switch model to glm-5.0",
+                     "No plan file found. Enter plan mode first with EnterPlanMode tool."):
+            self.assertEqual(_classify_directive(text), "noise_reply", text)
+
+    def test_taxonomy_does_not_shadow_push_forward(self):
+        # over_verification is checked before the taxonomy: "不用核实,我已经配置了,
+        # 执行先" also matches simpler_path's 不用/我来 shapes.
+        self.assertEqual(_classify_directive("不用核实,我已经配置了,执行先"),
+                         "over_verification")
+
+
+class TestPlanOutcomeCalibration(unittest.TestCase):
+    """Plan outcome口径 was set by the user: an interrupted plan counts as
+    incomplete INCLUDING design questions, because those are things the plan
+    should have settled before asking for approval. Only endorsement, pure
+    delegation and pure context drops are passes."""
+
+    def _plan_event(self, directive):
+        with tempfile.TemporaryDirectory() as d:
+            p = _write_jsonl(d, "s.jsonl", [
+                _assistant_tool("ExitPlanMode"),
+                _tool_result(f"{REJECT}. {INLINE}\n{directive}"),
+                *_pad(30),
+            ])
+            return scan_session_interventions(p, "claude")[0]["klass"]
+
+    def test_endorsement_prefix_is_not_a_rejection(self):
+        # 8 of 36 raw plan_rejected events open with an endorsement; counting
+        # them inflated the rate to 64%.
+        self.assertNotEqual(
+            self._plan_event("方向没问题, 让 codex 评审下计划, 你客观评估后输出优化版本"),
+            "plan_rejected")
+
+    def test_design_question_counts_as_incomplete_plan(self):
+        self.assertEqual(
+            self._plan_event("我看到还有以关键词搜索的,是不是这个默认就不应该归属分类,"
+                             "而是属于 tags,在搜索栏那里更合适呢? 思考产品逻辑设计"),
+            "plan_rejected")
+
+    def test_true_veto_counts_as_incomplete_plan(self):
+        self.assertEqual(
+            self._plan_event("简单的说不就是我直接改 vercel 配置不就好了,不用这么麻烦吧"),
+            "plan_rejected")
+
+    def test_pure_delegation_is_carved_out(self):
+        self.assertEqual(
+            self._plan_event("可以派遣 explore agent 查阅工作区未保存的图片"),
+            "delegate_directed")
+
+    def test_rate_denominator_includes_non_rejected_plan_events(self):
+        # An endorsed plan routed to delegate_directed must still land in the
+        # denominator, otherwise carving it out re-inflates the rate.
+        records = [
+            {"klass": "plan_rejected", "action": "ExitPlanMode", "tool": "claude",
+             "marker": "tool_rejected", "directive": "是不是该改成 tags?",
+             "session": "s.jsonl", "msg": 1, "month": "2026-08"},
+            {"klass": "delegate_directed", "action": "ExitPlanMode", "tool": "claude",
+             "marker": "tool_rejected", "directive": "方向没问题, 让 codex 评审",
+             "session": "s.jsonl", "msg": 5, "month": "2026-08"},
+        ]
+        meta = {"range": {"since": None, "until": None}, "files_scanned": 1,
+                "duplicates_dropped": 0,
+                "tools": {"claude": {"sessions": 1, "sessions_hit": 1,
+                                     "agent_actions": 10, "markers_wired": 2}}}
+        st = _intervention_stats(records, meta, samples_n=8)
+        self.assertEqual(st["plan_rejection_rate"], 0.5)
 
 
 class TestMarkerTableIsolation(unittest.TestCase):

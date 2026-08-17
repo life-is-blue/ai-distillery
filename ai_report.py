@@ -386,6 +386,53 @@ _STOP_RE = re.compile(
 _POLITE_RE = re.compile(r"要不要|好不好|是不是可以|能不能")
 _QUESTION_RE = re.compile(r"为什么|是不是|你觉得|怎么(样|办|知道)|[?？]")
 
+# Endorsement prefix. Measured on 36 plan_rejected events: 8 open with
+# "方向没问题" / "同意方案 A 的方向", i.e. the plan WAS approved and the user is
+# appending a delegation. Counting those as rejections inflated the plan
+# rejection rate to 64% when the true figure is ~9%. A rejection marker plus an
+# endorsement is an approval, not a veto.
+_ENDORSE_RE = re.compile(
+    r"(方向|方案|逻辑|思路)(没(问题|错)|ok|OK|可以)|^同意|没问题就|方向 ?ok"
+)
+
+# Hand-labelled taxonomy for what would otherwise be one opaque catch-all.
+# Derived by reading all 66 catch-all samples and having the user rule on each
+# group; the `counted` flag is the user's own call on whether better agent
+# behaviour would have removed the need to speak at all.
+#
+# Order matters — first match wins, most specific first. Kept as data rather
+# than branching logic so a future relabelling is a table edit, not a rewrite.
+_TAXONOMY = (
+    # (class, counts_as_intervention, pattern)
+    ("delegate_directed", True, re.compile(
+        r"让 ?codex|codebuddy|派遣|explore agent|gemini-frontend"
+        r"|你负责规划|你(来)?(负责)?(进行)?验收")),
+    ("plan_first", True, re.compile(
+        r"先规划|谋定而后动|真的理解|第一性原理|苏格拉底|审视看看计划"
+        r"|不用硬凑|输出整体计划|规划一下|下一步该做什么")),
+    ("simpler_path", True, re.compile(
+        r"更简单|不用这么麻烦|更合适|算了[,，]|不要着急|先跑起来|效率高很多"
+        r"|直接拉取|不用删了|我来处理")),
+    ("defect_report", True, re.compile(
+        r"不清晰|过于杂乱|还是慢|又出现|重复的问题|方向 ?ok|保持好品味|乱七八糟"
+        r"|质量问题|不明确的地方|重复表头|阻塞点|怎么回事|还没搞定|不是已经完成")),
+    ("context_supplied", True, re.compile(
+        r"我刚刚下载|另外一个项目|都登录完了|使用: ?http|访问 localhost"
+        r"|加入 git-library|放到项目根目录|你的同事在本地|我本地也配置|我删了")),
+    # Below: the user ruled these NORMAL COLLABORATION. Asking for status is how
+    # they choose to work, and handing over a new task is not a correction —
+    # counting either would turn "reduce interventions" into "make the user
+    # speak less", which is the wrong objective.
+    ("progress_query", False, re.compile(r"进度到哪里|总结我们完成|报告当前|现在进度")),
+)
+
+# Short acknowledgements and harness echo that carry no directive content.
+_EMPTY_REPLY_RE = re.compile(
+    r"^(你好|可以|可以的|好的|收到|嗯|ok|OK)[.。!！]?$|^\[?\x1b?\[?2m|Compacted \(ctrl"
+    r"|^Switch model to|^No plan file found|^<environment_context>"
+    r"|^The deployment was blocked|^Verify \d"
+)
+
 
 def _msg_parts(obj: dict) -> tuple[str, str, list[str]]:
     """Split one normalized message into (text, tool_result_text, tool_call_names).
@@ -428,19 +475,25 @@ def _is_synthetic(text: str) -> bool:
 def _classify_directive(directive: str) -> str:
     """Map a recovered user directive to a decision class.
 
-    Order matters: push-forward is checked before stop, because a message can
-    contain both ("不用核实,直接执行" has no stop word, but "别问了,你搞错了顺序"
-    does) and the push signal is the more actionable one for the envelope.
+    Order: empty -> push-forward -> stop -> hand-labelled taxonomy -> question
+    -> catch-all. Push and stop come first because they are the two classes with
+    a clear envelope implication; the taxonomy then resolves what used to be an
+    opaque 32% catch-all.
     """
     if not directive:
         return "unresolved"
+    if _EMPTY_REPLY_RE.search(directive.strip()):
+        return "noise_reply"
     if _PUSH_RE.search(directive):
         return "over_verification"
     if _STOP_RE.search(directive) and not _POLITE_RE.search(directive):
         return "wrong_direction"
+    for klass, _counted, pattern in _TAXONOMY:
+        if pattern.search(directive):
+            return klass
     if _QUESTION_RE.search(directive):
         return "counter_question"
-    return "redirect_other"
+    return "new_task"
 
 
 def scan_session_interventions(path: Path, tool: str) -> list[dict]:
@@ -469,8 +522,24 @@ def scan_session_interventions(path: Path, tool: str) -> list[dict]:
             rec["klass"] = "plan_approved"
         elif rec["infra"]:
             rec["klass"] = "infra_noise"
+        elif rec["action"] == "ExitPlanMode" and _ENDORSE_RE.search(rec["directive"]):
+            # "方向没问题, 让 codex 评审下计划" — the plan passed; what follows is a
+            # delegation, not a veto. Route to the taxonomy so the delegation
+            # itself is what gets counted.
+            rec["klass"] = _classify_directive(rec["directive"])
+            if rec["klass"] in ("new_task", "counter_question"):
+                rec["klass"] = "plan_endorsed"
         elif rec["action"] == "ExitPlanMode":
-            rec["klass"] = "plan_rejected"
+            # A plan interrupted without endorsement counts as incomplete, and
+            # that INCLUDES design questions ("是不是这个更适合放 tags") — per the
+            # user's own ruling, those are things the plan should have settled
+            # before asking for approval. Only carve out the cases that say
+            # nothing about plan quality: pure delegation, pure context drops,
+            # and events whose directive was never recoverable.
+            sub = _classify_directive(rec["directive"])
+            rec["klass"] = (sub if sub in ("delegate_directed", "context_supplied",
+                                           "unresolved", "noise_reply")
+                            else "plan_rejected")
         else:
             rec["klass"] = _classify_directive(rec["directive"])
         done.append(rec)
@@ -2727,23 +2796,45 @@ def _intervention_stats(records: list[dict], scan_meta: dict, samples_n: int) ->
     the point of this artifact is to be re-run in three months and diffed —
     prose diffs are unreadable.
     """
-    EXCLUDED = ("plan_approved", "infra_noise", "unresolved")
+    # Not interventions: plan approvals, infrastructure failures, unrecoverable
+    # directives, content-free acknowledgements, and the two classes the user
+    # ruled normal collaboration (asking for status, handing over a new task).
+    EXCLUDED = ("plan_approved", "plan_endorsed", "infra_noise", "unresolved",
+                "noise_reply", "new_task",
+                *(k for k, counted, _ in _TAXONOMY if not counted))
     CONFIDENCE = {
-        "plan_approved": "高（正向标记）", "plan_rejected": "高（结构性）",
-        "infra_noise": "高", "unresolved": "高（作为未知）",
+        "plan_approved": "高（正向标记）", "plan_endorsed": "高（认可前缀）",
+        "plan_rejected": "高（结构性）",
+        "infra_noise": "高", "unresolved": "高（作为未知）", "noise_reply": "高",
         "over_verification": "中（关键词）", "wrong_direction": "中（关键词）",
-        "counter_question": "低（关键词）", "redirect_other": "无（兜底）",
+        "delegate_directed": "中（人工标注）", "plan_first": "中（人工标注）",
+        "simpler_path": "中（人工标注）", "defect_report": "中（人工标注）",
+        "context_supplied": "中（人工标注）",
+        "progress_query": "中（正常协作）", "new_task": "低（兜底）",
+        "counter_question": "低（关键词）",
     }
     classes: dict[str, int] = {}
     matrix: dict[str, int] = {}
     per_tool: dict[str, dict] = {}
     per_month: dict[str, dict] = {}
     samples: dict[str, list] = {}
+    # Plan outcomes are tallied per event, independent of which class the event
+    # landed in: an endorsed plan usually gets routed to delegate_directed
+    # (because the endorsement is followed by "让 codex 评审"), and would
+    # otherwise vanish from the denominator and re-inflate the rejection rate.
+    plan_passed = plan_vetoed = 0
 
     for r in records:
         k = r["klass"]
         classes[k] = classes.get(k, 0) + 1
         matrix[f"{k}|{r['action']}"] = matrix.get(f"{k}|{r['action']}", 0) + 1
+        if k == "plan_rejected":
+            plan_vetoed += 1
+        elif r["action"] == "ExitPlanMode" or k == "plan_approved":
+            # Any other ExitPlanMode outcome (endorsed, delegated, context) is a
+            # pass. Per the user's ruling, design questions are NOT passes —
+            # those stay in plan_rejected above.
+            plan_passed += 1
         tool = r["tool"]
         t = per_tool.setdefault(tool, {"hard": 0, "excluded": 0})
         if k in EXCLUDED:
@@ -2753,8 +2844,9 @@ def _intervention_stats(records: list[dict], scan_meta: dict, samples_n: int) ->
             month = r.get("month") or "unknown"
             m = per_month.setdefault(month, {})
             m[tool] = m.get(tool, 0) + 1
-        # redirect_other gets a bigger sample: hand-labelling it is the point.
-        cap = samples_n * 2 if k == "redirect_other" else samples_n
+        # The catch-all gets a bigger sample: hand-labelling it is how new
+        # classes get discovered, which is how _TAXONOMY was built.
+        cap = samples_n * 2 if k == "new_task" else samples_n
         bucket = samples.setdefault(k, [])
         if len(bucket) < cap:
             bucket.append({
@@ -2784,7 +2876,8 @@ def _intervention_stats(records: list[dict], scan_meta: dict, samples_n: int) ->
             t: n for t, n in sorted(tools.items())
         }
 
-    pr, pa = classes.get("plan_rejected", 0), classes.get("plan_approved", 0)
+    # Endorsed plans count as passed: "方向没问题, 让 codex 评审" is a pass.
+    pr, pa = plan_vetoed, plan_passed
     return {
         "schema_version": 1,
         "generated_from": "ai_report.py interventions",
@@ -2881,14 +2974,18 @@ def _render_intervention_report(st: dict) -> str:
     out.append("\n".join(s))
 
     s = ["## 7. 已知局限\n",
-         f"- `redirect_other` 占 {100*st['classes'].get('redirect_other',0)/tot:.0f}%"
-         "——机械分类分不出来，需人工贴标签，这是下阶段 envelope 的真正输入",
+         f"- 兜底类 `new_task` 占 {100*st['classes'].get('new_task',0)/tot:.0f}%"
+         "——机械分不出来的残余，读第 6 段样本贴标签可扩充 _TAXONOMY",
          "- cursor/gemini 未覆盖；codebuddy 仪表化不足",
          "- cursor 全部消息无 timestamp，日期过滤依赖 mtime fallback",
-         "- over_verification / wrong_direction / counter_question 为关键词启发式，非结构性判定",
+         "- _TAXONOMY 五类（delegate_directed/plan_first/simpler_path/"
+         "defect_report/context_supplied）为人工标注 + 关键词匹配，非结构性判定",
+         "- progress_query / new_task 经用户裁定为正常协作，不计入分子——"
+         "否则\"减少干预\"会退化成\"让用户少说话\"",
          "- 未做软纠正层：实测 97% 命中是泛用词且约 11% 符号相反，一票否决"]
     if st["plan_rejection_rate"] is not None:
-        s.append(f"- 计划否决率 {st['plan_rejection_rate']:.0%}（对规划循环直接可用）")
+        s.append(f"- 计划否决率 {st['plan_rejection_rate']:.0%}"
+                 "（已剔除 plan_endorsed：带\"方向没问题\"前缀的是批准+委派，非否决）")
     out.append("\n".join(s))
     return "\n\n".join(out) + "\n"
 
