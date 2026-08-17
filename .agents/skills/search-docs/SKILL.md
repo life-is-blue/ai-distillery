@@ -1,6 +1,16 @@
 ---
 name: search-docs
-description: Use when users need source-grounded answers from git-library for API/tool/configuration/migration/troubleshooting questions, or when they ask for library structure/topics overview. Triggers: "search docs", "文档检索", "API 文档", "MCP 配置", "migration guide", "troubleshooting", "最新功能".
+description: >-
+  Retrieves source-grounded answers from the git-library knowledge base
+  by searching and reading official docs. Use when the user asks how a
+  documented product, API, SDK, CLI, or MCP tool works; wants official
+  docs, setup, configuration, migration, troubleshooting, latest features,
+  or a library topic overview; or prefers cited documentation over a
+  guessed answer. Typical asks include search docs, 查文档, 文档检索,
+  API 文档, 官方文档, 怎么配, MCP 配置, migration guide, troubleshooting,
+  排错, 最新功能, and how-does-X-work questions about documented tools.
+  Do not use for writing or reviewing application code that is not a
+  docs or API question.
 allowed-tools: Bash
 argument-hint: "[query]"
 ---
