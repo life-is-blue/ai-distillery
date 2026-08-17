@@ -6,7 +6,7 @@ CONVERTER := python3 ai_log_converter.py
 export AI_LOGS_DIR := $(LOGS)
 
 test:
-	python3 tests/test_conversion.py
+	python3 -m unittest discover -s tests -p 'test_*.py'
 
 clean:
 	rm -rf __pycache__ tests/__pycache__

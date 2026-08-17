@@ -77,6 +77,45 @@ SOUL_SYSTEM = (
     "Every entry MUST include at least one concrete evidence anchor: command, file, tool, "
     "API, error message, or quoted user phrase. Entries without evidence anchors are rejected.")
 
+INTERACTION_SYSTEM = (
+    "你是对话交互模式提取器。\n"
+    "输入：用户与 AI 的逐轮对话（已保留提问的邻接关系）。\n"
+    "目标：提炼用户如何提问、如何反问、如何对齐验收的可复用交互模式，供未来的\n"
+    "harness / loop engineering 引用——因此每条必须可溯源到用户原话。\n\n"
+    "输出 0-5 条高信号交互模式（输出 `NONE` 表示无充分证据），组织在 3 个维度下：\n\n"
+    "### 提问（Questioning）\n"
+    "用户如何提出初始问题、如何拆分问题、是否做假设验证/边界测试/逐步递进。\n"
+    "### 反问（Counter-questioning）\n"
+    "用户如何用问题而非断言来纠偏、引导、检验 AI 的理解（苏格拉底式探问）。\n"
+    "### 对齐验收（Alignment）\n"
+    "用户如何确认需求、验收结果、表达满意/不满、设立完成标准。\n\n"
+    "## 输出格式\n"
+    "以 `## Interaction` 开头，每条一行：\n"
+    "  - **<维度>**: <模式描述，具体可复现> | Evidence: <用户原话或行为> <!-- pk: key --> <!-- priority: NN -->\n\n"
+    "## 输出门槛（宁缺毋滥）\n"
+    "默认输出 0 条。只有同时满足才输出：\n"
+    "1. 有用户原话锚点（引号内的真实问句/指令）\n"
+    "2. 是\"如何提问/如何互动\"的模式，不是\"用户偏好什么工具/结论\"（那是 Preferences/Patterns 的职责）\n"
+    "3. 可被未来的 harness 复用（不是一次性任务细节）\n\n"
+    "## 识别信号\n"
+    "- 提问：'为什么'、'如果…会怎样'、'你是怎么知道'、'先别急着…先告诉我'、分步骤编号提问\n"
+    "- 反问：'你觉得呢'、'那 X 怎么办'、'你说 Y，但 Z 呢'、用问题纠正 AI 的假设\n"
+    "- 对齐：'先出计划再动手'、'按你的来，干吧'、'先给我看暂存区'、'结论要有代码证据'\n\n"
+    "## Priority 打分（每条必填）\n"
+    "- 80-100：高频复现、或明确是用户固定的提问/验收风格\n"
+    "- 50-79：单次但证据扎实的交互模式\n"
+    "- <50：模糊次要——直接不输出\n\n"
+    "## Exclusion Rules（绝不记录）\n"
+    "1. 用户偏好/价值观（那是 Preferences 的职责）\n"
+    "2. 技术陷阱/方法论（那是 LESSONS 的职责）\n"
+    "3. 一次性任务细节\n"
+    "4. 无用户原话锚点的泛化描述\n\n"
+    "## pk 标签\n"
+    "- 每条追加 <!-- pk: 2-4-word-kebab-case -->，同类模式复用同一 pk\n"
+    "- pk 是未来晋升 Gene / 跨日计数复现的桥梁，必须稳定\n\n"
+    "原则：措辞强度不超过用户原话；宁可 0-2 条高质量，不要 3-5 条噪音。"
+)
+
 DISTILL_SYSTEM = (
     "你是一个用户心智模型蒸馏器。\n"
     "输入：当前 MEMORY.md 规则 + 最近的观察记录 + 机械统计的 pattern-key 出现天数。\n"
@@ -247,7 +286,8 @@ SOUL_SKELETON = (
     "## Identity\n\n"
     "## Preferences\n\n"
     "## Patterns\n\n"
-    "## Context\n")
+    "## Context\n\n"
+    "## Interaction\n")
 
 MEMORY_SKELETON = (
     "# MEMORY.md — Behavioral Rules\n\n"
@@ -268,7 +308,7 @@ SOUL_DEDUP_SYSTEM = (
     "你是记忆冲突检测器。输入是一个 section 内的候选池（同一 SOUL.md section 下的所有条目，"
     "每条带 id），任务是找出语义重复/可合并的条目，输出结构化操作，不改写不重复的条目。\n\n"
     "## 输入格式\n"
-    '{"section": "Preferences|Patterns|Context", "entries": [{"id": "xxxxxxxx", "content": "..."}]}\n\n'
+    '{"section": "Preferences|Patterns|Context|Interaction", "entries": [{"id": "xxxxxxxx", "content": "..."}]}\n\n'
     "## 判断逻辑\n"
     "- 只在同一 section 内比较，不跨 section\n"
     "- 语义重复（同一偏好/同一行为模式/同一事实的不同表述）→ merge，合并为一条信息量最大的版本\n"
@@ -284,6 +324,8 @@ SOUL_DEDUP_SYSTEM = (
     "- Preferences: 保持原格式 `- PREFER x / REJECT y\\n  Why: ...\\n  How: ...`，"
     "合并时 Why/How 各取信息量更大的版本，不要各写一半拼接\n"
     "- Patterns: 保持原格式 `- **类型**: 观察 | Evidence: <证据> <!-- pk: key --> <!-- priority: NN -->`，"
+    "必须保留原有 `<!-- pk: -->` 标签（若多条 pk 不同，取语义最贴切的一个）\n"
+    "- Interaction: 同 Patterns，保持原格式 `- **维度**: 描述 | Evidence: <证据> <!-- pk: key --> <!-- priority: NN -->`，"
     "必须保留原有 `<!-- pk: -->` 标签（若多条 pk 不同，取语义最贴切的一个）\n"
     "- Context: 保持原格式 `- <事实> (since YYYY-MM-DD) <!-- priority: NN -->`，since 日期取最早出现的\n"
     "- 不要在 content 里包含 `<!-- id -->`/`<!-- new -->`/`<!-- absorbed -->` 标签，这些由程序重新生成\n\n"
