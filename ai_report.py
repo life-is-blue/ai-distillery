@@ -10,6 +10,7 @@ Subcommands:
   distill      Distill SOUL + LESSONS → MEMORY.md rules
   dream        Consolidate SOUL.md: merge duplicates, prune stale entries
   gene-health  Compute Gene freshness, rebuild registry
+  interventions Mine user intervention points → autonomy baseline (mechanical)
   sync-memory  Commit and push ai-memory/ to remote
 
 Config via .env (auto-loaded):
@@ -21,6 +22,7 @@ Config via .env (auto-loaded):
   AI_LOGS_DIR           Memory directory (default: ./ai-memory)
 """
 import argparse, hashlib, json, os, re, subprocess, sys
+from collections import deque
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -31,6 +33,7 @@ from ai_prompts import (
     REPORT_SYSTEM, SOUL_SYSTEM, DISTILL_SYSTEM, GROUNDING_SYSTEM,
     LESSONS_SYSTEM, SOUL_SKELETON, LESSONS_SKELETON, MEMORY_SKELETON,
     SOUL_DEDUP_SYSTEM, MEMORY_DEDUP_SYSTEM, AGENTS_SYSTEM, GENE_REVIEW_SYSTEM,
+    INTERACTION_SYSTEM,
 )
 
 
@@ -235,6 +238,322 @@ def extract_turns(path: Path, max_chars: int = 2000, target_date: date = None, t
 
 
 
+def extract_interaction_turns(path: Path, max_chars: int = 6000, target_date: date = None) -> str:
+    """Extract turns PRESERVING adjacency, for interaction-pattern extraction.
+
+    Unlike extract_turns() (which flattens to isolated [user]/[assistant] lines
+    for report/soul purposes), this keeps the conversational structure:
+    [user] → [assistant] → [user] — because question/counter-question patterns
+    only exist in the adjacency between turns, not in isolated messages.
+
+    Budget allocation is INVERTED vs extract_turns(): assistant turns are
+    truncated harder (120 chars — just enough context to see what the user is
+    responding to), while user turns get the full budget (800 chars). Here the
+    user message IS the payload — a counter-question lives inside it — whereas
+    in report/soul the assistant summary was the payload.
+
+    Tool-only turns are dropped from the transcript (they carry no linguistic
+    signal) but still COUNT toward adjacency, so a [user] question that follows
+    a tool_call is preserved in position.
+    """
+    turns, total = [], 0
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                role = obj.get("role", "")
+                if role not in ("user", "assistant"):
+                    continue
+                if target_date is not None:
+                    d = _ts_to_date((obj.get("meta") or {}).get("timestamp"))
+                    if d != target_date:
+                        continue
+                content = obj.get("content", "")
+                if isinstance(content, list):
+                    texts = [i.get("text", "") for i in content if i.get("type") == "text"]
+                    content = " ".join(texts)
+                if not isinstance(content, str):
+                    continue
+                content = content.strip()
+                if not content:
+                    continue
+                if role == "user":
+                    limit = 800
+                    entry = f"[user] {content[:limit]}"
+                else:
+                    limit = 120
+                    entry = f"[assistant] {content[:limit]}"
+                total += len(entry)
+                if total > max_chars:
+                    break
+                turns.append(entry)
+    except OSError:
+        return ""
+    return "\n".join(turns)
+
+
+# ---------------------------------------------------------------------------
+# Intervention mining (mechanical, no LLM)
+#
+# Measures where the user actually takes over from the agent, so the autonomy
+# envelope can be derived from data instead of guessed. Every marker below was
+# verified against the real corpus — see the notes on each for why it is shaped
+# this way. Do not "simplify" these into a fuzzy keyword list; that was tried
+# and measured, and it matched prose ("It rejects mixed content"), stack traces
+# (processTicksAndRejections) and pasted git output far more often than real
+# interventions.
+# ---------------------------------------------------------------------------
+
+# Per-tool hard markers. Full phrases only — the bare word "rejected" has ~538
+# corpus hits that are overwhelmingly `API Error: Request rejected (429)` and
+# `[remote rejected] main -> main`, i.e. infrastructure, not governance.
+#
+# NOTE the rejection marker lives in a tool_result block, and in codebuddy it
+# arrives under role="tool" rather than role="user". Filtering on role="user"
+# or reading only type=="text" blocks silently drops all 18 codebuddy hits —
+# and codebuddy is 299 of the 660 sessions.
+_CLAUDE_MARKERS = (
+    ("interrupted", "[Request interrupted by user]"),
+    ("tool_rejected", "The user doesn't want to proceed with this tool use"),
+)
+_HARD_MARKERS = {
+    "claude": _CLAUDE_MARKERS,
+    "tclaude": _CLAUDE_MARKERS,
+    "codebuddy": _CLAUDE_MARKERS,
+    "codex": (("turn_aborted", "<turn_aborted>"),),
+    # cursor/gemini have no known marker. An honest zero beats a fabricated
+    # number — cmd_interventions reports them as uncovered.
+    "cursor": (),
+    "gemini": (),
+}
+
+# Positive approval markers. Claude Code's plan flow emits a *rejection*
+# tool_result and then the approval re-prompt, so an ExitPlanMode "interrupt"
+# is usually an approval wearing a rejection costume. Checking only the
+# adjacent message misclassifies these; look forward for these markers instead.
+_APPROVE_MARKER = "User has approved your plan"
+_IMPL_MARKER = "Implement the following plan"
+
+# The rejection tool_result often embeds what the user said instead. This is
+# the highest-quality directive signal in the corpus (32 events).
+_INLINE_DIRECTIVE = "To tell you how to proceed, the user said:"
+
+# Harness plumbing that is not user intent. Without this filter these get
+# classified as directives (e.g. "The user wants to clarify these questions"
+# is Claude Code's own AskUserQuestion re-prompt).
+_SYNTHETIC_PREFIXES = (
+    "<command-name>", "<command-message>", "<command-args>", "<local-command",
+    "<system-reminder", "<task-notification>", "<user-prompt-submit-hook>",
+    "<turn_aborted>", "# agents.md instructions",
+    "caveat:", "this session is being continued", "copied to clipboard",
+    "the user wants to clarify these questions", "[request interrupted",
+    "api error:", "set model to", "ran git ", "worked for ",
+)
+
+# Attribution window: how far back to look for the tool_call being interrupted.
+# 8 resolves all but ~19 events, and those are genuinely tool-less (plain text
+# turn + Esc). Widening starts attributing an interrupt to an unrelated tool
+# many turns back, which is worse than an honest "(none)".
+_ATTRIB_WINDOW = 8
+_DIRECTIVE_WINDOW = 20   # forward messages to search for what the user said
+_APPROVE_WINDOW = 30     # forward messages to search for the approval marker
+
+# Classification keyword sets, derived from the corpus rather than invented.
+#
+# The push-forward class is the counter-intuitive finding: the largest single
+# action bucket (Bash) is dominated by the user shoving the agent forward
+# ("不用核实,我已经配置了,执行先") rather than restraining it. The envelope
+# implication is the opposite of what "intervention" suggests.
+_PUSH_RE = re.compile(
+    r"不用(核实|验证|检查|测试|管|问|了)|我已经(配置|改好|设置|装|部署|授权|提交)"
+    r"|直接(执行|干|上|推|跑|技能|使用)|执行先|(推送|提交)吧|我授权|授权了|别问|干吧"
+    r"|按流程处理|没问题就|就这样吧|(请|你)?继续|开始(吧|合并)|确认[.。]?$|同意"
+    r"|本地切换先|别想复杂了"
+)
+_STOP_RE = re.compile(
+    r"不对|不是这样|方向(不对|错)|停下|先别|回退|回滚|撤销|revert"
+    r"|错了|搞错|坏品味|搞复杂|过度设计"
+)
+# Politeness guard: 要不要/好不好 are *suggestions* ("要不要也优化一下"), the
+# opposite polarity of a correction. Measured: 11 of 104 naive soft-tier hits
+# were these, i.e. a sign error.
+_POLITE_RE = re.compile(r"要不要|好不好|是不是可以|能不能")
+_QUESTION_RE = re.compile(r"为什么|是不是|你觉得|怎么(样|办|知道)|[?？]")
+
+
+def _msg_parts(obj: dict) -> tuple[str, str, list[str]]:
+    """Split one normalized message into (text, tool_result_text, tool_call_names).
+
+    Handles `content` as either a list of blocks or a bare string. Reads BOTH
+    text and tool_result blocks — the rejection markers live in tool_result.
+    """
+    content = obj.get("content", "")
+    if isinstance(content, str):
+        return content, "", []
+    if not isinstance(content, list):
+        return "", "", []
+    texts, results, tools = [], [], []
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        btype = b.get("type")
+        if btype == "text":
+            t = b.get("text")
+            if isinstance(t, str):
+                texts.append(t)
+        elif btype == "tool_result":
+            c = b.get("content")
+            results.append(c if isinstance(c, str) else json.dumps(c, ensure_ascii=False))
+        elif btype == "tool_call":
+            name = b.get("name")
+            if isinstance(name, str) and name:
+                tools.append(name)
+    return " ".join(texts), " ".join(results), tools
+
+
+def _is_synthetic(text: str) -> bool:
+    """True if text is harness plumbing rather than something the user typed."""
+    low = text.strip().lower()
+    if not low:
+        return True
+    return low.startswith(_SYNTHETIC_PREFIXES)
+
+
+def _classify_directive(directive: str) -> str:
+    """Map a recovered user directive to a decision class.
+
+    Order matters: push-forward is checked before stop, because a message can
+    contain both ("不用核实,直接执行" has no stop word, but "别问了,你搞错了顺序"
+    does) and the push signal is the more actionable one for the envelope.
+    """
+    if not directive:
+        return "unresolved"
+    if _PUSH_RE.search(directive):
+        return "over_verification"
+    if _STOP_RE.search(directive) and not _POLITE_RE.search(directive):
+        return "wrong_direction"
+    if _QUESTION_RE.search(directive):
+        return "counter_question"
+    return "redirect_other"
+
+
+def scan_session_interventions(path: Path, tool: str) -> list[dict]:
+    """Stream one session, returning one record per intervention event.
+
+    Single pass with a bounded lookback deque and a pending-resolution queue —
+    the largest session is 7.2MB/3775 lines, so the file is never materialized.
+    Each pending event resolves forward for its directive and for the approval
+    marker, then finalizes once its windows expire.
+    """
+    markers = _HARD_MARKERS.get(tool, ())
+    if not markers:
+        return []
+
+    lookback: deque = deque(maxlen=_ATTRIB_WINDOW)
+    pending: list[dict] = []
+    done: list[dict] = []
+    prev_was_marker = False
+    idx = -1
+
+    def _finalize(rec: dict) -> None:
+        # The IMPL marker is checked globally, not just under ExitPlanMode:
+        # measured, it also follows Edit and no-tool actions, and it always
+        # means the plan was approved.
+        if rec["plan_approved"] or _IMPL_MARKER in rec["directive"]:
+            rec["klass"] = "plan_approved"
+        elif rec["infra"]:
+            rec["klass"] = "infra_noise"
+        elif rec["action"] == "ExitPlanMode":
+            rec["klass"] = "plan_rejected"
+        else:
+            rec["klass"] = _classify_directive(rec["directive"])
+        done.append(rec)
+
+    try:
+        fh = open(path, encoding="utf-8")
+    except OSError:
+        return []
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            idx += 1
+            role = obj.get("role", "") or ""
+            text, results, tools = _msg_parts(obj)
+            blob = f"{text}\n{results}"
+
+            hit = next((label for label, needle in markers if needle in blob), None)
+
+            # Resolve pending events against this message before anything else.
+            # A message bearing a marker never supplies a directive — for codex
+            # the marker sits in the user text itself, so it would otherwise
+            # become its own directive.
+            still_pending = []
+            for rec in pending:
+                rec["seen"] += 1
+                # Approval only counts while the event is still unanswered. The
+                # forward window is wide enough to catch a *later, unrelated*
+                # plan approval, which would wrongly excuse this interruption.
+                if _APPROVE_MARKER in blob and not rec["directive"]:
+                    rec["plan_approved"] = True
+                if (not rec["directive"] and role == "user" and not hit
+                        and rec["seen"] <= _DIRECTIVE_WINDOW
+                        and text.strip() and not _is_synthetic(text)):
+                    rec["directive"] = text.strip()
+                if rec["seen"] >= _APPROVE_WINDOW:
+                    _finalize(rec)
+                else:
+                    still_pending.append(rec)
+            pending = still_pending
+
+            if hit:
+                # Claude emits the rejection tool_result and the interrupt text
+                # back to back; collapse the pair into one event.
+                if not prev_was_marker:
+                    action = "(none)"
+                    for prev_role, prev_tools, _ in reversed(lookback):
+                        if prev_role.startswith("assistant") and prev_tools:
+                            action = prev_tools[0]
+                            break
+                    infra = any(
+                        pt.lstrip().startswith("API Error")
+                        for pr, _, pt in reversed(lookback)
+                        if pr.startswith("assistant")
+                    )
+                    directive = ""
+                    if _INLINE_DIRECTIVE in results:
+                        inline = results.split(_INLINE_DIRECTIVE, 1)[1].strip()
+                        if inline and not _is_synthetic(inline):
+                            directive = inline
+                    pending.append({
+                        "marker": hit, "action": action, "directive": directive,
+                        "infra": infra, "plan_approved": False, "seen": 0,
+                        "msg": idx, "tool": tool,
+                    })
+                prev_was_marker = True
+            else:
+                # Only assistant/tool activity breaks a marker run; a bare
+                # continuation shouldn't merge two genuinely separate events.
+                prev_was_marker = False
+
+            lookback.append((role, tools, text))
+
+    for rec in pending:
+        _finalize(rec)
+    return done
+
+
 def quality_gate(observations: str) -> str:
     """Filter out low-signal observation bullets. Returns empty string if nothing survives."""
     REJECT_PATTERNS = [
@@ -293,7 +612,7 @@ def grounding_check(observations: str, user_turns: str) -> str:
 
     # ── Structured format: entry-aware grounding ──────────────────────────
     _PK_RE = re.compile(r'\s*<!--\s*pk:\s*[\w-]+\s*-->')
-    SECTION_ORDER = ("Identity", "Preferences", "Patterns", "Context")
+    SECTION_ORDER = ("Identity", "Preferences", "Patterns", "Context", "Interaction")
 
     def _extract_claim(section_name: str, entry: str) -> str | None:
         """Return grounding claim for entry, or None if it fails quality gate."""
@@ -470,7 +789,7 @@ def priority_gate(observations: str) -> str:
     """
     if "## " not in observations:
         return observations
-    SECTION_ORDER = ("Identity", "Preferences", "Patterns", "Context")
+    SECTION_ORDER = ("Identity", "Preferences", "Patterns", "Context", "Interaction")
     sections = _parse_soul_sections(observations)
     priority_re = re.compile(r'<!--\s*priority:\s*(\d+)\s*-->')
 
@@ -770,8 +1089,34 @@ def cmd_soul(args):
     # Legacy format cleanup: remove "Sessions processed: N" if present
     content = re.sub(r"> Sessions processed: \d+\n", "", content)
 
-    # Merge new observations into 4-section structure
+    # Merge new observations into 5-section structure
     content = _merge_soul_entry(content, observations, str(entry_date))
+
+    # ── Interaction pass ────────────────────────────────────────────────
+    # Adjacency-preserving extraction of questioning / counter-questioning /
+    # alignment patterns (for harness & loop engineering). Reuses `sessions`
+    # selected above; only the excerpting differs — extract_interaction_turns
+    # inverts the budget toward user turns and keeps turn adjacency, which is
+    # where question/counter-question structure lives.
+    interaction_chunks = []
+    for s in sessions:
+        excerpt = extract_interaction_turns(s, max_chars=6000, target_date=target_date)
+        if excerpt:
+            interaction_chunks.append(excerpt)
+    if interaction_chunks:
+        interaction_raw = call_engine("\n\n---\n\n".join(interaction_chunks), INTERACTION_SYSTEM)
+        if interaction_raw and interaction_raw.strip() != "NONE":
+            interaction_raw = quality_gate(interaction_raw)
+            if interaction_raw:
+                user_turns_text = "\n".join(
+                    l for chunk in interaction_chunks
+                    for l in chunk.splitlines() if l.startswith("[user]")
+                ) + "\n"
+                interaction_raw = grounding_check(interaction_raw, user_turns_text)
+                if interaction_raw:
+                    interaction_raw = priority_gate(interaction_raw)
+                    if interaction_raw:
+                        content = _merge_soul_entry(content, interaction_raw, str(entry_date))
 
     soul_path.write_text(content, encoding="utf-8")
     print(f"OK {soul_path} ({entry_date}, +{len(sessions)} sessions)", file=sys.stderr)
@@ -1570,11 +1915,11 @@ def _parse_soul_sections(content: str) -> dict[str, list[str]]:
     Unknown sections and header content are ignored.
     """
     result: dict[str, list[str]] = {
-        "Identity": [], "Preferences": [], "Patterns": [], "Context": []
+        "Identity": [], "Preferences": [], "Patterns": [], "Context": [], "Interaction": []
     }
     parts = re.split(r"(?=^## )", content, flags=re.M)
     for part in parts:
-        m = re.match(r"^## (Identity|Preferences|Patterns|Context)\s*\n", part)
+        m = re.match(r"^## (Identity|Preferences|Patterns|Context|Interaction)\s*\n", part)
         if not m:
             continue
         section_name = m.group(1)
@@ -1655,7 +2000,7 @@ def _merge_soul_entry(
     """
     new_sections = _parse_soul_sections(new_observations)
 
-    for section_name in ("Identity", "Preferences", "Patterns", "Context"):
+    for section_name in ("Identity", "Preferences", "Patterns", "Context", "Interaction"):
         new_entries = new_sections.get(section_name, [])
         if not new_entries:
             continue
@@ -1680,10 +2025,10 @@ def _merge_soul_entry(
 def _rebuild_soul(original_content: str, sections_entries: dict[str, list[str]]) -> str:
     """Rebuild SOUL.md preserving the header (metadata block) and replacing
     the 4 sections with the supplied entries."""
-    section_names = ("Identity", "Preferences", "Patterns", "Context")
+    section_names = ("Identity", "Preferences", "Patterns", "Context", "Interaction")
     # Everything before the first canonical ## section is the header
     first_section_re = re.compile(
-        r"^## (?:Identity|Preferences|Patterns|Context)", re.M
+        r"^## (?:Identity|Preferences|Patterns|Context|Interaction)", re.M
     )
     m_first = first_section_re.search(original_content)
     if m_first:
@@ -1941,7 +2286,7 @@ def cmd_dream(args):
         else:
             print(f"Dream: consolidating SOUL.md ({entry_count} entries) via structured dedup...", file=sys.stderr)
             new_sections = dict(sections)
-            for section in ("Preferences", "Patterns", "Context"):
+            for section in ("Preferences", "Patterns", "Context", "Interaction"):
                 before = sections.get(section, [])
                 after = _dedup_pool(before, {"section": section}, SOUL_DEDUP_SYSTEM)
                 new_sections[section] = after
@@ -2375,6 +2720,294 @@ def cmd_daily(args):
     print(f"OK {out_path}", file=sys.stderr)
 
 
+def _intervention_stats(records: list[dict], scan_meta: dict, samples_n: int) -> dict:
+    """Aggregate intervention records into the JSON SSOT.
+
+    JSON is the source of truth and the markdown is rendered from it, because
+    the point of this artifact is to be re-run in three months and diffed —
+    prose diffs are unreadable.
+    """
+    EXCLUDED = ("plan_approved", "infra_noise", "unresolved")
+    CONFIDENCE = {
+        "plan_approved": "高（正向标记）", "plan_rejected": "高（结构性）",
+        "infra_noise": "高", "unresolved": "高（作为未知）",
+        "over_verification": "中（关键词）", "wrong_direction": "中（关键词）",
+        "counter_question": "低（关键词）", "redirect_other": "无（兜底）",
+    }
+    classes: dict[str, int] = {}
+    matrix: dict[str, int] = {}
+    per_tool: dict[str, dict] = {}
+    per_month: dict[str, dict] = {}
+    samples: dict[str, list] = {}
+
+    for r in records:
+        k = r["klass"]
+        classes[k] = classes.get(k, 0) + 1
+        matrix[f"{k}|{r['action']}"] = matrix.get(f"{k}|{r['action']}", 0) + 1
+        tool = r["tool"]
+        t = per_tool.setdefault(tool, {"hard": 0, "excluded": 0})
+        if k in EXCLUDED:
+            t["excluded"] += 1
+        else:
+            t["hard"] += 1
+            month = r.get("month") or "unknown"
+            m = per_month.setdefault(month, {})
+            m[tool] = m.get(tool, 0) + 1
+        # redirect_other gets a bigger sample: hand-labelling it is the point.
+        cap = samples_n * 2 if k == "redirect_other" else samples_n
+        bucket = samples.setdefault(k, [])
+        if len(bucket) < cap:
+            bucket.append({
+                "provenance": f"{r['session']}:msg{r['msg']}",
+                "action": r["action"], "marker": r["marker"],
+                "directive": r["directive"][:200],
+            })
+
+    for tool, meta in scan_meta["tools"].items():
+        per_tool.setdefault(tool, {"hard": 0, "excluded": 0}).update({
+            "sessions": meta["sessions"],
+            "sessions_hit": meta["sessions_hit"],
+            "agent_actions": meta["agent_actions"],
+            "markers_wired": meta["markers_wired"],
+            "covered": bool(meta["markers_wired"]),
+        })
+
+    hard_total = sum(v["hard"] for v in per_tool.values())
+    actions_total = sum(v.get("agent_actions", 0) for v in per_tool.values())
+    for tool, v in per_tool.items():
+        acts = v.get("agent_actions", 0)
+        v["rate_per_100"] = round(100 * v["hard"] / acts, 2) if acts else None
+
+    rate_trend = {}
+    for month, tools in sorted(per_month.items()):
+        rate_trend[month] = {
+            t: n for t, n in sorted(tools.items())
+        }
+
+    pr, pa = classes.get("plan_rejected", 0), classes.get("plan_approved", 0)
+    return {
+        "schema_version": 1,
+        "generated_from": "ai_report.py interventions",
+        "range": scan_meta["range"],
+        "scan": {
+            "files_scanned": scan_meta["files_scanned"],
+            "duplicates_dropped": scan_meta["duplicates_dropped"],
+            "events": len(records),
+            "hard_interventions": hard_total,
+            "agent_actions": actions_total,
+            "rate_per_100_actions": round(100 * hard_total / actions_total, 3) if actions_total else None,
+        },
+        "excluded_classes": list(EXCLUDED),
+        "classes": dict(sorted(classes.items(), key=lambda x: -x[1])),
+        "class_confidence": CONFIDENCE,
+        "class_action_matrix": dict(sorted(matrix.items(), key=lambda x: -x[1])),
+        "per_tool": per_tool,
+        "monthly_counts": rate_trend,
+        "plan_rejection_rate": round(pr / (pr + pa), 3) if (pr + pa) else None,
+        "samples": samples,
+    }
+
+
+def _render_intervention_report(st: dict) -> str:
+    """Render the human-readable baseline from the JSON SSOT."""
+    rng = st["range"]
+    sc = st["scan"]
+    out = [f"# 干预点基线报告 — {rng['since'] or '起始'} ~ {rng['until'] or '至今'}\n"]
+    out.append("> Auto-generated from interventions-*.json — do not edit\n")
+
+    s = ["## 1. 覆盖与方法\n",
+         "| 工具 | sessions | 命中 sessions | agent 动作 | 已接标记 | 覆盖 |",
+         "|------|----------|---------------|-----------|---------|------|"]
+    for tool, v in sorted(st["per_tool"].items()):
+        cov = "是" if v.get("covered") else "**未覆盖**"
+        s.append(f"| {tool} | {v.get('sessions', 0)} | {v.get('sessions_hit', 0)} "
+                 f"| {v.get('agent_actions', 0)} | {v.get('markers_wired', 0)} | {cov} |")
+    s.append(f"\n- 扫描文件 {sc['files_scanned']}，按内容去重丢弃 {sc['duplicates_dropped']} 个冗余副本")
+    s.append("- cursor/gemini 无已知中断标记，其 0 值是**未覆盖**而非无干预")
+    out.append("\n".join(s))
+
+    excl = sc["events"] - sc["hard_interventions"]
+    s = ["## 2. 硬层口径\n",
+         f"- 原始事件 {sc['events']}",
+         f"- 排除 {excl}（" + "、".join(
+             f"{k} {st['classes'].get(k, 0)}" for k in st["excluded_classes"]) + "）",
+         f"- **硬干预 {sc['hard_interventions']}**",
+         f"- agent 动作总数 {sc['agent_actions']}，全局率 {sc['rate_per_100_actions']}/100 动作"]
+    out.append("\n".join(s))
+
+    s = ["## 3. 率趋势（按工具分列）\n",
+         "全局单一数字会误导：工具构成变化和仪表化差异都会压低它。只看分列。\n",
+         "| 月份 | " + " | ".join(sorted(st["per_tool"])) + " |",
+         "|------|" + "|".join(["-----"] * len(st["per_tool"])) + "|"]
+    tools = sorted(st["per_tool"])
+    for month, counts in st["monthly_counts"].items():
+        s.append(f"| {month} | " + " | ".join(str(counts.get(t, 0)) for t in tools) + " |")
+    # Flag tools whose low count may be under-instrumentation rather than
+    # autonomy: markers are wired but almost no session ever hits one.
+    weak = [t for t, v in st["per_tool"].items()
+            if v.get("covered") and v.get("sessions", 0) >= 50
+            and v.get("sessions_hit", 0) / max(1, v.get("sessions", 1)) < 0.15]
+    if weak:
+        s.append("\n**口径说明**：" + "、".join(weak) +
+                 " 虽已接入标记，但命中 session 占比 <15%，其低值可能部分来自仪表化不足，"
+                 "不能直接读作自主度高。")
+    out.append("\n".join(s))
+
+    s = ["## 4. class 分布\n", "| class | 数量 | 占比 | 置信度 |", "|-------|------|------|--------|"]
+    tot = sc["events"] or 1
+    for k, n in st["classes"].items():
+        s.append(f"| {k} | {n} | {100*n/tot:.0f}% | {st['class_confidence'].get(k, '?')} |")
+    out.append("\n".join(s))
+
+    s = ["## 5. class x action 矩阵\n",
+         "下一阶段写 pre-authorized / must-stop 策略的直接依据。\n",
+         "| class | action | 数量 |", "|-------|--------|------|"]
+    for key, n in list(st["class_action_matrix"].items())[:20]:
+        k, a = key.split("|", 1)
+        s.append(f"| {k} | {a} | {n} |")
+    out.append("\n".join(s))
+
+    s = ["## 6. 逐字样本（精度审计面）\n",
+         "读这一段。若某类样本不成立，当场否决该类，别让它流入下游。\n"]
+    for k in st["classes"]:
+        bucket = st["samples"].get(k) or []
+        if not bucket:
+            continue
+        s.append(f"\n### {k} ({st['classes'][k]}，展示 {len(bucket)})\n")
+        for smp in bucket:
+            d = smp["directive"].replace("\n", " ").strip() or "(无)"
+            s.append(f"- `[{smp['action']}]` {d}")
+            s.append(f"  - {smp['provenance']}")
+    out.append("\n".join(s))
+
+    s = ["## 7. 已知局限\n",
+         f"- `redirect_other` 占 {100*st['classes'].get('redirect_other',0)/tot:.0f}%"
+         "——机械分类分不出来，需人工贴标签，这是下阶段 envelope 的真正输入",
+         "- cursor/gemini 未覆盖；codebuddy 仪表化不足",
+         "- cursor 全部消息无 timestamp，日期过滤依赖 mtime fallback",
+         "- over_verification / wrong_direction / counter_question 为关键词启发式，非结构性判定",
+         "- 未做软纠正层：实测 97% 命中是泛用词且约 11% 符号相反，一票否决"]
+    if st["plan_rejection_rate"] is not None:
+        s.append(f"- 计划否决率 {st['plan_rejection_rate']:.0%}（对规划循环直接可用）")
+    out.append("\n".join(s))
+    return "\n\n".join(out) + "\n"
+
+
+def cmd_interventions(args):
+    """Mine user intervention points from session logs — mechanical, no LLM.
+
+    Produces the autonomy baseline: where the user actually takes over, what the
+    agent was doing, and what the user said instead. Deliberately NOT wired into
+    cron/make daily — ~0.9 events/day would be an empty section you learn to skip.
+    """
+    logs_dir = Path(args.logs)
+    since, until = args.since, args.until
+    samples_n = max(1, args.samples)
+
+    seen_hashes: set[str] = set()
+    records: list[dict] = []
+    tools_meta: dict[str, dict] = {}
+    files_scanned = 0
+    duplicates = 0
+
+    for p in find_sessions(logs_dir):
+        tool = p.relative_to(logs_dir).parts[0]
+        if args.tool and tool != args.tool:
+            continue
+        # Session-level date filtering: cursor has no per-message timestamps at
+        # all, so per-message filtering would drop it entirely. session_days()
+        # has the mtime fallback.
+        if since or until:
+            days = session_days(p)
+            if not days:
+                continue
+            if since and max(days) < since:
+                continue
+            if until and min(days) > until:
+                continue
+        try:
+            digest = hashlib.md5(p.read_bytes()).hexdigest()
+        except OSError:
+            continue
+        if digest in seen_hashes:
+            duplicates += 1
+            continue
+        seen_hashes.add(digest)
+        files_scanned += 1
+
+        meta = tools_meta.setdefault(tool, {
+            "sessions": 0, "sessions_hit": 0, "agent_actions": 0,
+            "markers_wired": len(_HARD_MARKERS.get(tool, ())),
+        })
+        meta["sessions"] += 1
+        meta["agent_actions"] += _count_agent_actions(p)
+
+        recs = scan_session_interventions(p, tool)
+        if recs:
+            meta["sessions_hit"] += 1
+        rel = str(p.relative_to(logs_dir))
+        month = ""
+        days = session_days(p)
+        if days:
+            month = f"{max(days):%Y-%m}"
+        for r in recs:
+            r["session"] = rel
+            r["month"] = month
+            records.append(r)
+
+    scan_meta = {
+        "range": {"since": since.isoformat() if since else None,
+                  "until": until.isoformat() if until else None},
+        "files_scanned": files_scanned,
+        "duplicates_dropped": duplicates,
+        "tools": tools_meta,
+    }
+    stats = _intervention_stats(records, scan_meta, samples_n)
+
+    stamp_date = until or date.today()
+    reports_dir = logs_dir / "reports"
+    month_dir = _report_month_dir(reports_dir, stamp_date)
+    month_dir.mkdir(parents=True, exist_ok=True)
+    slug = f"{since or 'all'}_{until or 'all'}"
+    json_path = month_dir / f"interventions-{slug}.json"
+    json_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2) + "\n",
+                         encoding="utf-8")
+    written = [json_path]
+    if not args.json_only:
+        md_path = month_dir / f"interventions-{slug}.md"
+        md_path.write_text(_render_intervention_report(stats), encoding="utf-8")
+        written.append(md_path)
+    for w in written:
+        print(f"OK {w}", file=sys.stderr)
+
+
+def _count_agent_actions(path: Path) -> int:
+    """Count assistant messages carrying >=1 tool_call — the intervention denominator.
+
+    Sessions span 290-4947 messages, so per-session rates are useless for trend;
+    agent actions are the thing that actually gets interrupted.
+    """
+    n = 0
+    try:
+        fh = open(path, encoding="utf-8")
+    except OSError:
+        return 0
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not str(obj.get("role", "")).startswith("assistant"):
+                continue
+            if _msg_parts(obj)[2]:
+                n += 1
+    return n
+
+
 def cmd_sync_memory(args):
     """Commit and push ai-memory/ (which IS the ai-memory repo) to remote.
 
@@ -2444,11 +3077,18 @@ def main():
     dr.add_argument("--logs", default=default_logs)
     dr.add_argument("--soul", default=str(Path(default_logs) / "SOUL.md"))
     dr.add_argument("--memory", default=str(Path(default_logs) / "MEMORY.md"))
+    iv = sub.add_parser("interventions")
+    iv.add_argument("--logs", default=default_logs)
+    iv.add_argument("--since", type=date.fromisoformat, default=None)
+    iv.add_argument("--until", type=date.fromisoformat, default=None)
+    iv.add_argument("--tool", default=None)
+    iv.add_argument("--samples", type=int, default=8)
+    iv.add_argument("--json-only", action="store_true")
     args = p.parse_args()
     {"report": cmd_report, "soul": cmd_soul, "push": cmd_push,
      "distill": cmd_distill, "lessons": cmd_lessons,
      "gene-health": cmd_gene_health, "daily": cmd_daily,
-     "sync-memory": cmd_sync_memory,
+     "sync-memory": cmd_sync_memory, "interventions": cmd_interventions,
      "dream": cmd_dream}[args.cmd](args)
 
 

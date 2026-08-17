@@ -1,4 +1,4 @@
-.PHONY: test clean harvest report push soul dream distill lessons gene-health daily sync-memory install-cron uninstall-cron backfill-soul setup
+.PHONY: test clean harvest report push soul dream distill lessons gene-health daily interventions sync-memory install-cron uninstall-cron backfill-soul setup
 
 LOGS     := $(CURDIR)/ai-memory
 CONVERTER := python3 ai_log_converter.py
@@ -111,6 +111,12 @@ gene-health:
 
 daily:
 	@python3 ai_report.py daily --logs $(LOGS)
+
+# Autonomy baseline. Deliberately NOT in install-cron: ~0.9 events/day means a
+# daily run would be an empty section you learn to skip. Run it when you want a
+# reading, and diff the JSON against the previous run.
+interventions:
+	@python3 ai_report.py interventions --logs $(LOGS)
 
 sync-memory:
 	@python3 ai_report.py sync-memory --logs $(LOGS)
