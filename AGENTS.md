@@ -93,7 +93,7 @@ WECOM_WEBHOOK_URL=https://...    # optional, for push
 - `distill [--force] [--soul FILE] [--memory FILE] [--lessons FILE]` — distill SOUL.md + LESSONS.md → MEMORY.md rules (structured diff, Gene promotion suggestions)
 - `lessons [--date YYYY-MM-DD] [--lessons FILE]` — extract lessons learned → LESSONS.md (错题本: 坑/因/法 + area tags)
 - `gene-health [--genes-dir DIR]` — compute Gene freshness (decay model), rebuild registry.json, output health report
-- `daily [--date YYYY-MM-DD]` — daily health report: knowledge summary, promotion candidates, duplicate detection, rule freshness, pipeline health (no LLM)
+- `daily [--date YYYY-MM-DD] [--strict]` — daily health report: knowledge summary, promotion candidates, duplicate detection, rule freshness, pipeline health (no LLM). `--strict` exits 1 if any open findings remain (CI/local enforcement); default stays soft for the cron chain
 - `interventions [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--tool NAME] [--samples N] [--json-only]` — mine where the user takes over from the agent → autonomy baseline. Emits `reports/YYYY/MM/interventions-{range}.json` as SSOT plus a rendered `.md`. Mechanical, no LLM. Per-tool hard markers only (cursor/gemini uncovered — reported as such, never as zero interventions); rates are reported per tool because a single global number is dominated by tool mix
 - `sync-memory [--logs DIR]` — commit and push ai-memory/ to ai-memory remote
 

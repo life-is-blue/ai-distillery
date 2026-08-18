@@ -24,6 +24,7 @@ from ai_report import (
     _intervention_stats,
     _render_intervention_report,
     _TAXONOMY,
+    _should_fail_daily,
     find_sessions,
 )
 
@@ -233,6 +234,22 @@ class TestAttribution(unittest.TestCase):
                 *_pad(30),
             ])
             self.assertEqual(scan_session_interventions(p, "claude")[0]["action"], "Read")
+
+
+class TestDailyEnforcementGate(unittest.TestCase):
+    """Closure for the daily health report: detection without consequence is
+    zero effect (Gray & Scholz 1991). The gate must fail ONLY in --strict mode
+    with open findings, and stay soft under the default cron path."""
+
+    def test_strict_with_findings_fails(self):
+        self.assertTrue(_should_fail_daily(["审查 91 条过时规则"], strict=True))
+
+    def test_default_with_findings_is_soft(self):
+        self.assertFalse(_should_fail_daily(["审查 91 条过时规则"], strict=False))
+
+    def test_no_findings_never_fails(self):
+        self.assertFalse(_should_fail_daily([], strict=True))
+        self.assertFalse(_should_fail_daily([], strict=False))
 
 
 class TestTaxonomy(unittest.TestCase):

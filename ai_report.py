@@ -2548,7 +2548,7 @@ def cmd_daily(args):
     out_path = month_dir / f"daily-health-{target_date}.md"
 
     sections = []
-    todos = []
+    findings = []
 
     # --- Section 1: 知识库摘要 ---
     s1 = [f"## 1. 知识库摘要\n"]
@@ -2592,11 +2592,11 @@ def cmd_daily(args):
     s1.append(f"| genes/ | {gene_active + gene_stale + gene_degraded} 个 Gene | active {gene_active}, stale {gene_stale}, degraded {gene_degraded} |")
     sections.append("\n".join(s1))
     if gene_stale:
-        todos.append(f"审查 {gene_stale} 个 stale Gene")
+        findings.append(f"审查 {gene_stale} 个 stale Gene")
     if gene_degraded:
-        todos.append(f"处理 {gene_degraded} 个 degraded Gene")
+        findings.append(f"处理 {gene_degraded} 个 degraded Gene")
     if les_review:
-        todos.append(f"审查 {les_review} 条 needs-review 教训")
+        findings.append(f"审查 {les_review} 条 needs-review 教训")
 
     # --- Section 2: 提升候选 ---
     s2 = ["## 2. 提升候选\n"]
@@ -2605,7 +2605,7 @@ def cmd_daily(args):
     if candidates:
         for pk, cnt in candidates:
             s2.append(f"- `{pk}` ({cnt} 天) → 可提取为 Gene: `scripts/extract-gene.sh {pk}`")
-        todos.append(f"评估 {len(candidates)} 个 Gene 晋升候选")
+        findings.append(f"评估 {len(candidates)} 个 Gene 晋升候选")
     else:
         s2.append("无候选（需 pk ≥ 3 天）")
     sections.append("\n".join(s2))
@@ -2623,7 +2623,7 @@ def cmd_daily(args):
     if duplicates:
         for a, b, sim in duplicates:
             s3.append(f"- `{a}` ↔ `{b}` (相似度 {sim:.0%})")
-        todos.append(f"检查 {len(duplicates)} 对潜在重复教训")
+        findings.append(f"检查 {len(duplicates)} 对潜在重复教训")
     else:
         s3.append("未发现重复")
     sections.append("\n".join(s3))
@@ -2682,7 +2682,7 @@ def cmd_daily(args):
                 s6.append(f"- {r[:80]}...")
             if len(stale_rules) > 5:
                 s6.append(f"- ...及其他 {len(stale_rules) - 5} 条")
-            todos.append(f"审查 {len(stale_rules)} 条可能过时的规则")
+            findings.append(f"审查 {len(stale_rules)} 条可能过时的规则")
     else:
         s6.append("MEMORY.md 为空或无规则")
     sections.append("\n".join(s6))
@@ -2704,8 +2704,8 @@ def cmd_daily(args):
 
     # --- Section 8: 待办事项 ---
     s8 = ["## 8. 待办事项\n"]
-    if todos:
-        for i, t in enumerate(todos, 1):
+    if findings:
+        for i, t in enumerate(findings, 1):
             s8.append(f"{i}. {t}")
     else:
         s8.append("无待办 — 一切正常")
@@ -2778,8 +2778,14 @@ def cmd_daily(args):
     if recommendations:
         for r in recommendations:
             s9.append(f"- {r}")
-    else:
+            findings.append(r)
+    # 健康由 ALL findings 决定，不是只看第 9 节这组建议。曾有 91 条 stale
+    # 规则进入待办、第 9 节却输出"系统状态健康"——检测无后果等于零效果
+    # (Gray & Scholz 6,842 厂：开罚单降 22% 工伤、不开罚单零效果)。
+    if not findings:
         s9.append("无建议 — 系统状态健康")
+    else:
+        s9.append(f"\n**健康由 {len(findings)} 条待处理发现决定** —— 见第 8 节")
     sections.append("\n".join(s9))
 
     # Write report
@@ -2787,6 +2793,27 @@ def cmd_daily(args):
     content = header + "\n\n".join(sections) + "\n"
     out_path.write_text(content, encoding="utf-8")
     print(f"OK {out_path}", file=sys.stderr)
+
+    # Enforcement closure (see research in plan): detection without consequence
+    # is zero effect (Gray & Scholz 1991: penalized inspections -22% injuries,
+    # penalty-free inspections no effect; Best/Shah/Waseem 2021: detected-but-
+    # unconsequenced audits deter nothing). In --strict mode, open findings
+    # make the command fail so CI/local calls can't be green while unhealthy.
+    if _should_fail_daily(findings, args.strict):
+        print(f"daily: {len(findings)} open findings — non-zero exit (--strict)",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+def _should_fail_daily(findings: list, strict: bool) -> bool:
+    """Enforcement gate: fail only in --strict mode AND when findings are open.
+
+    Extracted from cmd_daily so the closure is unit-testable without running
+    the whole report pipeline. Default (cron) mode stays soft — see the cron
+    chain, which runs `make daily` inside `{ ... }` before a `;`-joined
+    sync-memory, so a hard fail there would halt the upstream chain.
+    """
+    return bool(strict and findings)
 
 
 def _intervention_stats(records: list[dict], scan_meta: dict, samples_n: int) -> dict:
@@ -3168,6 +3195,8 @@ def main():
     da = sub.add_parser("daily")
     da.add_argument("--logs", default=default_logs)
     da.add_argument("--date", type=date.fromisoformat, default=None)
+    da.add_argument("--strict", action="store_true",
+                    help="exit 1 if any open findings remain (CI/local enforcement)")
     sm = sub.add_parser("sync-memory")
     sm.add_argument("--logs", default=default_logs)
     dr = sub.add_parser("dream")
