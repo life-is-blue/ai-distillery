@@ -2702,36 +2702,6 @@ def cmd_daily(args):
         s7.append(f"| {day} | {n_sessions} | {'✓' if has_report else '—'} | {'✓' if has_soul else '—'} | +{n_lessons} |")
     sections.append("\n".join(s7))
 
-    # --- Section 8: 待办事项 ---
-    s8 = ["## 8. 待办事项\n"]
-    if findings:
-        for i, t in enumerate(findings, 1):
-            s8.append(f"{i}. {t}")
-    else:
-        s8.append("无待办 — 一切正常")
-
-    # Read and clear skip buffer for today
-    skips = read_and_clear_skip_buffer(logs_dir)
-    if skips:
-        by_source: dict = {}
-        for s in skips:
-            by_source.setdefault(s['source'], []).append(s)
-        s8.append("\n### 今日 Skip 摘要\n")
-        for source in ('lessons', 'distill', 'gene'):
-            items = by_source.get(source, [])
-            if not items:
-                continue
-            s8.append(f"\n**{source.upper()}** ({len(items)} 项跳过):")
-            for item in items[:5]:
-                reason = item.get('reason', item.get('decision', '?'))
-                label = item.get('slug') or item.get('pk') or item.get('summary', '?')
-                s8.append(f"- `{label}`: {reason}")
-            if len(items) > 5:
-                s8.append(f"- ...及其他 {len(items)-5} 项")
-
-    sections.append("\n".join(s8))
-
-
     # --- Section 9: 可操作建议 ---
     s9 = ["## 9. 可操作建议\n"]
     recommendations = []
@@ -2781,11 +2751,40 @@ def cmd_daily(args):
             findings.append(r)
     # 健康由 ALL findings 决定，不是只看第 9 节这组建议。曾有 91 条 stale
     # 规则进入待办、第 9 节却输出"系统状态健康"——检测无后果等于零效果
-    # (Gray & Scholz 6,842 厂：开罚单降 22% 工伤、不开罚单零效果)。
     if not findings:
         s9.append("无建议 — 系统状态健康")
     else:
         s9.append(f"\n**健康由 {len(findings)} 条待处理发现决定** —— 见第 8 节")
+
+    # 第 8 节清单必须在 findings 完全收集后渲染（第 9 节会往里追加），
+    # 否则清单漏掉建议项、计数却包含它们，两处显示不一致。
+    s8 = ["## 8. 待办事项\n"]
+    if findings:
+        for i, t in enumerate(findings, 1):
+            s8.append(f"{i}. {t}")
+    else:
+        s8.append("无待办 — 一切正常")
+
+    # Read and clear skip buffer for today
+    skips = read_and_clear_skip_buffer(logs_dir)
+    if skips:
+        by_source: dict = {}
+        for s in skips:
+            by_source.setdefault(s['source'], []).append(s)
+        s8.append("\n### 今日 Skip 摘要\n")
+        for source in ('lessons', 'distill', 'gene'):
+            items = by_source.get(source, [])
+            if not items:
+                continue
+            s8.append(f"\n**{source.upper()}** ({len(items)} 项跳过):")
+            for item in items[:5]:
+                reason = item.get('reason', item.get('decision', '?'))
+                label = item.get('slug') or item.get('pk') or item.get('summary', '?')
+                s8.append(f"- `{label}`: {reason}")
+            if len(items) > 5:
+                s8.append(f"- ...及其他 {len(items)-5} 项")
+
+    sections.append("\n".join(s8))
     sections.append("\n".join(s9))
 
     # Write report

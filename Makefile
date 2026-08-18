@@ -109,8 +109,12 @@ lessons:
 gene-health:
 	@python3 ai_report.py gene-health --genes-dir $(LOGS)/genes
 
+# STRICT=1 时 findings 非空则 exit 1（CI/本地强制）。默认软报告：
+# cron 链用 { ... }; 连接，硬失败会中断上游；且 findings 指"需要动手的
+# 待办"，不含"没来用系统"（无 session / Gene 陈旧是信息，不是故障）。
+STRICT ?=
 daily:
-	@python3 ai_report.py daily --logs $(LOGS)
+	@python3 ai_report.py daily --logs $(LOGS) $(if $(STRICT),--strict)
 
 # Autonomy baseline. Deliberately NOT in install-cron: ~0.9 events/day means a
 # daily run would be an empty section you learn to skip. Run it when you want a
