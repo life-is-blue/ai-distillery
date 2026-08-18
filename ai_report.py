@@ -2591,10 +2591,8 @@ def cmd_daily(args):
     s1.append(f"| MEMORY.md | {mem_total} 条规则 | MUST {mem_counts['MUST']}, MUST_NOT {mem_counts['MUST NOT']}, PREFER {mem_counts['PREFER']}, CONTEXT {mem_counts['CONTEXT']} |")
     s1.append(f"| genes/ | {gene_active + gene_stale + gene_degraded} 个 Gene | active {gene_active}, stale {gene_stale}, degraded {gene_degraded} |")
     sections.append("\n".join(s1))
-    if gene_stale:
-        findings.append(f"审查 {gene_stale} 个 stale Gene")
-    if gene_degraded:
-        findings.append(f"处理 {gene_degraded} 个 degraded Gene")
+    # Gene 的 stale/degraded 不入 findings：新鲜度低 = "方法论最近没用"，
+    # 属于没来用系统，不是需要动手的故障（用户裁定）。第 5 节仍展示状态。
     if les_review:
         findings.append(f"审查 {les_review} 条 needs-review 教训")
 
