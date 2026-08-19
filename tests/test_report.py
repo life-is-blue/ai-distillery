@@ -79,6 +79,18 @@ class TestParseDistillOps(unittest.TestCase):
         ops = parse_distill_ops(raw)
         self.assertEqual(len(ops), 0)
 
+    def test_add_with_pk_tag_parses(self):
+        """The pk suffix is carried inside the content — regex must not strip it."""
+        raw = "ADD MUST: Always read before edit <!-- pk: read-before-edit -->"
+        ops = parse_distill_ops(raw)
+        self.assertEqual(len(ops), 1)
+        self.assertEqual(ops[0], ("ADD", "MUST", "Always read before edit <!-- pk: read-before-edit -->"))
+
+    def test_legacy_add_without_pk_still_parses(self):
+        raw = "ADD MUST: Always read before edit"
+        ops = parse_distill_ops(raw)
+        self.assertEqual(ops[0], ("ADD", "MUST", "Always read before edit"))
+
 
 class TestApplyOps(unittest.TestCase):
     def _skeleton(self):
@@ -115,7 +127,20 @@ class TestApplyOps(unittest.TestCase):
         ops = [("ADD", "MUST", "First rule ever")]
         result = apply_ops("", ops)
         self.assertIn("## MUST", result)
-        self.assertIn("- First rule ever", result)
+
+    def test_add_with_pk_writes_tag_through(self):
+        content = self._skeleton()
+        ops = [("ADD", "MUST", "Always read before edit <!-- pk: read-before-edit -->")]
+        result = apply_ops(content, ops)
+        self.assertIn("- Always read before edit <!-- pk: read-before-edit -->", result)
+
+    def test_weaken_preserves_pk_tag(self):
+        content = self._skeleton().replace(
+            "## MUST\n", "## MUST\n- Strict rule here <!-- pk: strict-rule -->\n")
+        ops = [("WEAKEN", "MUST", "Strict rule here <!-- pk: strict-rule -->")]
+        result = apply_ops(content, ops)
+        self.assertNotIn("## MUST\n- Strict rule here", result)
+        self.assertIn("Strict rule here <!-- pk: strict-rule --> (待观察)", result)
 
 
 class TestQualityGate(unittest.TestCase):
@@ -722,6 +747,132 @@ class TestCheckRuleFreshness(unittest.TestCase):
             self.assertEqual(results["Writing pipeline: draft -> reviewer -> illustrator"], "stale")
             self.assertEqual(results["Use Conventional Commits format for messages"], "stale")
             self.assertEqual(results["Please commit small changes"], "evidenced")
+
+    def test_exact_pk_join_marks_evidenced(self):
+        """Tier 1: a pk-bearing rule joins on its OWN pk, not on word matches."""
+        with tempfile.TemporaryDirectory() as d:
+            today = date.today().isoformat()
+            soul = self._write(d, "SOUL.md", (
+                "# SOUL.md\n\n## Identity\n\n## Preferences\n\n## Patterns\n\n"
+                f"- Plans before acting | Evidence: x <!-- pk: plan-before-act --> <!-- new: {today} -->\n\n"
+                "## Context\n"
+            ))
+            memory = self._write(d, "MEMORY.md", (
+                "## MUST\n\n"
+                "- Always plan first <!-- pk: plan-before-act -->\n"
+            ))
+            results = dict(_check_rule_freshness(memory, soul))
+            self.assertEqual(results["Always plan first <!-- pk: plan-before-act -->"], "evidenced")
+
+    def test_exact_pk_join_marks_stale_when_pk_not_recent(self):
+        """Tier 1 must decide BEFORE Tier 2: a pk-bearing rule with a non-recent
+        pk stays 'stale' even if its words match another recent pk."""
+        with tempfile.TemporaryDirectory() as d:
+            today = date.today().isoformat()
+            # recent pk is plan-before-act; the rule's pk is review-before-commit (not recent)
+            soul = self._write(d, "SOUL.md", (
+                "# SOUL.md\n\n## Identity\n\n## Preferences\n\n## Patterns\n\n"
+                f"- Plans before acting | Evidence: x <!-- pk: plan-before-act --> <!-- new: {today} -->\n\n"
+                "## Context\n"
+            ))
+            memory = self._write(d, "MEMORY.md", (
+                "## MUST\n\n"
+                "- Plan then review before committing <!-- pk: review-before-commit -->\n"
+            ))
+            results = dict(_check_rule_freshness(memory, soul))
+            # words "plan"/"before" match the recent pk, but the rule's OWN pk is stale
+            self.assertEqual(results["Plan then review before committing <!-- pk: review-before-commit -->"], "stale")
+
+    def test_rule_without_pk_falls_back_to_word_split(self):
+        """Tier 2 unchanged for pk-less rules: word match → evidenced, else stale."""
+        with tempfile.TemporaryDirectory() as d:
+            today = date.today().isoformat()
+            soul = self._write(d, "SOUL.md", (
+                "# SOUL.md\n\n## Identity\n\n## Preferences\n\n## Patterns\n\n"
+                f"- Plans before acting | Evidence: x <!-- pk: plan-before-act --> <!-- new: {today} -->\n\n"
+                "## Context\n"
+            ))
+            memory = self._write(d, "MEMORY.md", (
+                "## MUST\n\n"
+                "- Plan before acting on ambiguous requests\n"
+                "- Completely unrelated rule\n"
+            ))
+            results = dict(_check_rule_freshness(memory, soul))
+            self.assertEqual(results["Plan before acting on ambiguous requests"], "evidenced")
+            self.assertEqual(results["Completely unrelated rule"], "stale")
+
+    def test_malformed_pk_tag_falls_back_without_crashing(self):
+        with tempfile.TemporaryDirectory() as d:
+            today = date.today().isoformat()
+            soul = self._write(d, "SOUL.md", (
+                "# SOUL.md\n\n## Identity\n\n## Preferences\n\n## Patterns\n\n"
+                f"- Plans before acting | Evidence: x <!-- pk: plan-before-act --> <!-- new: {today} -->\n\n"
+                "## Context\n"
+            ))
+            memory = self._write(d, "MEMORY.md", (
+                "## MUST\n\n"
+                "- Rule with id only <!-- id: abc12345 -->\n"
+                "- Rule with broken pk <!-- pk: -->\n"
+            ))
+            results = dict(_check_rule_freshness(memory, soul))
+            # neither matches a recent pk's words → both stale, no crash
+            self.assertEqual(results["Rule with id only <!-- id: abc12345 -->"], "stale")
+            self.assertEqual(results["Rule with broken pk <!-- pk: -->"], "stale")
+
+
+class TestCmdDistillPkAttach(unittest.TestCase):
+    """End-to-end: a pk-bearing unabsorbed LESSONS entry → ADD op with pk tag →
+    MEMORY.md rule carries <!-- pk: xxx --> → freshness marks it evidenced."""
+
+    def test_pk_flows_from_entry_to_rule(self):
+        from unittest import mock
+        from types import SimpleNamespace
+        import ai_report as ar
+
+        with tempfile.TemporaryDirectory() as d:
+            today = date.today().isoformat()
+            # unabsorbed LESSONS entry carrying a pk
+            lessons = Path(d) / "LESSONS.md"
+            lessons.write_text(
+                "# LESSONS.md\n\n"
+                "## plan-before-act\n"
+                f"> {today} | pk: plan-before-act | area: arch | type: method | priority: 80\n\n"
+                "**法**: 先规划再执行\n"
+                "**步**: 1) 探索 → 2) 对齐 → 3) 执行\n"
+                "**用**: 非平凡任务\n",
+                encoding="utf-8")
+            soul = Path(d) / "SOUL.md"
+            soul.write_text(
+                "# SOUL.md\n\n## Identity\n\n## Preferences\n\n## Patterns\n\n## Context\n",
+                encoding="utf-8")
+            memory = Path(d) / "MEMORY.md"
+            # 与 MEMORY_SKELETON 一致的格式（apply_ops 设计时预期的锚点结构）。
+            # 注意：真实生产 MEMORY 带 ### Universal 子层，apply_ops 的 ADD 会
+            # 追加到段尾（子层之外）——那是独立的现存 bug，不在本次范围。
+            memory.write_text(
+                "## MUST\n\n## MUST NOT\n\n## PREFER\n\n## CONTEXT\n",
+                encoding="utf-8")
+
+            # Fake the LLM: it saw the pk in the entry prose and echoes it on the rule
+            fake_response = (
+                "ADD PREFER: 非平凡任务先规划对齐再动手 <!-- pk: plan-before-act -->\n"
+                "## Skipped\nNone"
+            )
+            args = SimpleNamespace(soul=str(soul), memory=str(memory),
+                                   lessons=str(lessons), force=True, logs=d)
+            with mock.patch.object(ar, "call_engine", return_value=fake_response):
+                ar.cmd_distill(args)
+
+            mem = memory.read_text(encoding="utf-8")
+            self.assertIn("非平凡任务先规划对齐再动手 <!-- pk: plan-before-act -->", mem)
+            # entry got marked absorbed
+            self.assertIn("absorbed: true", lessons.read_text(encoding="utf-8"))
+
+            # freshness now exact-joins: pk in SOUL? No — but the LESSONS source had
+            # it; freshness reads SOUL only, so without SOUL evidence it's stale
+            results = dict(_check_rule_freshness(memory, soul))
+            self.assertEqual(
+                results["非平凡任务先规划对齐再动手 <!-- pk: plan-before-act -->"], "stale")
 
 
 class TestParseSkippedSection(unittest.TestCase):

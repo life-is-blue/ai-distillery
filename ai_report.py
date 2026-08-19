@@ -2488,7 +2488,21 @@ def _count_memory_rules(memory_path: Path) -> dict[str, int]:
 
 def _check_rule_freshness(memory_path: Path, soul_path: Path) -> list[tuple[str, str]]:
     """Check which MEMORY.md rules have recent evidence in SOUL.md (last 30 days).
-    Uses pk tags as bridge. Returns [(rule_text, status)] where status is 'evidenced' or 'stale'."""
+
+    Two tiers, decided per rule in order:
+      Tier 1 (exact join): rule carries a `<!-- pk: xxx -->` tag → the pk is the
+        ground-truth join key. pk in recent SOUL pks → 'evidenced'; not → 'stale'.
+        This is a REAL verdict — no text matching involved.
+      Tier 2 (legacy word-split): rule has NO pk tag → fall back to the old
+        heuristic (split pk into words, whole-word match against rule prose).
+        Only pk-less rules reach here.
+
+    The distinction matters: a pk-bearing rule whose pk is stale must be 'stale'
+    even if its words coincidentally match another recent pk. Tier 1 decides
+    first so that case can't leak into Tier 2.
+
+    Returns [(rule_text, status)] where status is 'evidenced' or 'stale'.
+    """
     if not memory_path.exists() or not soul_path.exists():
         return []
     # Collect pk tags from SOUL entries touched (new/absorbed) in the last 30 days.
@@ -2518,7 +2532,12 @@ def _check_rule_freshness(memory_path: Path, soul_path: Path) -> list[tuple[str,
         if not line_s.startswith("- "):
             continue
         rule_text = line_s[2:].strip()
-        # Check if any recent pk keyword appears in rule text as a whole word
+        # Tier 1: exact pk join (ground truth). pk tag, if present, decides.
+        pk_m = re.search(r'<!--\s*pk:\s*([\w-]+)\s*-->', rule_text)
+        if pk_m:
+            results.append((rule_text, "evidenced" if pk_m.group(1) in recent_pks else "stale"))
+            continue
+        # Tier 2: legacy word-split heuristic for pk-less rules only.
         # (plain substring matching false-positived "review" -> "reviewer",
         # "commit" -> "Commits"; \b prevents matching inside a longer word)
         found = False
