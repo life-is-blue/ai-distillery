@@ -126,8 +126,8 @@ sync-memory:
 	@python3 ai_report.py sync-memory --logs $(LOGS)
 
 install-cron:
-	@(crontab -l 2>/dev/null | grep -v 'ai-distillery-cron'; echo "47 8 * * * cd $(CURDIR) && cd $(LOGS) && git pull --rebase --quiet 2>/dev/null; cd $(CURDIR); { make harvest && make report && make push && make soul && make dream && make lessons && make distill && make gene-health && make daily; }; make sync-memory >> /tmp/ai-report.log 2>&1 # ai-distillery-cron") | crontab -
-	@echo "Cron installed: sync-memory always runs even if upstream step fails"
+	@(crontab -l 2>/dev/null | grep -v 'ai-distillery-cron'; echo "47 8 * * * export PATH=/data/home/bluejqhuang/.nvm/versions/node/v24.14.1/bin:/usr/bin:/bin:\$$PATH; cd $(CURDIR) && cd $(LOGS) && git pull --rebase --quiet 2>/dev/null; cd $(CURDIR); { make harvest && make report && make push && make soul && make dream && make lessons && make distill && make gene-health && make daily; } >> /tmp/ai-report.log 2>&1; make sync-memory >> /tmp/ai-report.log 2>&1 # ai-distillery-cron") | crontab -
+	@echo "Cron installed: nvm/codex PATH injected; pipeline + sync both log to /tmp/ai-report.log"
 
 uninstall-cron:
 	@crontab -l 2>/dev/null | grep -v 'ai-distillery-cron' | crontab -
