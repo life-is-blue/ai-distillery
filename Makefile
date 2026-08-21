@@ -165,7 +165,7 @@ setup:
 	@echo ""
 	@if [ ! -f .env ]; then \
 		echo "Creating .env template..."; \
-		printf '# ai-distillery configuration\nLLM_API_KEY=your-api-key-here\n# LLM_BASE_URL=https://api.openai.com/v1\n# LLM_MODEL_NAME=gpt-4o-mini\n# WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx\n' > .env; \
+		printf '# ai-distillery configuration\nLLM_API_KEY=your-api-key-here\n# LLM_BASE_URL=https://api.openai.com/v1\n# LLM_MODEL_NAME=deepseek-v4-flash\n# WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx\n' > .env; \
 		echo "✓ .env created — EDIT IT with your API key before continuing"; \
 		echo ""; \
 		exit 1; \

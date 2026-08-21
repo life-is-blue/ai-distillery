@@ -39,7 +39,7 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = None) -> str:
     if not api_key:
         print("LLM_API_KEY not set", file=sys.stderr); sys.exit(1)
     base = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    model = os.environ.get("LLM_MODEL_NAME", "gpt-4o-mini")
+    model = os.environ.get("LLM_MODEL_NAME", "deepseek-v4-flash")
     msgs = []
     if system:
         msgs.append({"role": "system", "content": system})
@@ -81,15 +81,28 @@ def call_llm(prompt: str, system: str = "", max_tokens: int = None) -> str:
 
 
 def _call_codex(content: str, system: str) -> str:
-    """Call codex exec: content via stdin, system prompt as instruction."""
-    result = subprocess.run(
-        ["codex", "exec", "--ephemeral", system],
-        input=content, capture_output=True, text=True, timeout=300
-    )
-    if result.returncode != 0:
-        print(f"codex exec failed ({result.returncode}): {result.stderr[:200]}", file=sys.stderr)
-        return ""
-    return result.stdout.strip()
+    """Call codex exec, retrying once before using the HTTP fallback."""
+    cmd = ["codex", "exec", "--ephemeral", system]
+    for attempt in range(2):
+        try:
+            result = subprocess.run(
+                cmd, input=content, capture_output=True, text=True, timeout=300
+            )
+        except subprocess.TimeoutExpired:
+            print(f"codex exec timed out (attempt {attempt + 1}/2)", file=sys.stderr)
+        else:
+            if result.returncode == 0:
+                return result.stdout.strip()
+            # Codex prints a long startup banner before the actionable error.
+            # Keep the tail so cron logs preserve the actual root cause.
+            detail = result.stderr.strip()[-2000:]
+            print(
+                f"codex exec failed ({result.returncode}, attempt {attempt + 1}/2): {detail}",
+                file=sys.stderr,
+            )
+        if attempt == 0:
+            time.sleep(2)
+    return ""
 
 
 @lru_cache(maxsize=1)
@@ -124,8 +137,8 @@ def call_engine(content: str, system: str, max_tokens: int = 4000, allow_chunkin
 
 
 def _call_llm_auto(content: str, system: str, max_tokens: int, allow_chunking: bool = True) -> str:
-    """call_llm with auto-batching for small-context models (e.g. glm-5.1 ~8K tokens)."""
-    MAX_PROMPT_CHARS = 6000  # safe for glm-5.1: ~3K tokens content + system overhead
+    """call_llm with conservative auto-batching for fallback models."""
+    MAX_PROMPT_CHARS = 6000
     if len(content) + len(system) < MAX_PROMPT_CHARS or not allow_chunking:
         return call_llm(content, system, max_tokens)
 

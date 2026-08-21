@@ -16,7 +16,7 @@ Subcommands:
 Config via .env (auto-loaded):
   LLM_API_KEY           API key (required for report/soul/lessons/distill)
   LLM_BASE_URL          OpenAI-compatible endpoint (default: https://api.openai.com/v1)
-  LLM_MODEL_NAME        Model name (default: gpt-4o-mini)
+  LLM_MODEL_NAME        Model name (default: deepseek-v4-flash)
   LLM_MAX_TOKENS        Max tokens for LLM response (default: 2000)
   WECOM_WEBHOOK_URL     WeCom group robot webhook (optional, for push)
   AI_LOGS_DIR           Memory directory (default: ./ai-memory)
