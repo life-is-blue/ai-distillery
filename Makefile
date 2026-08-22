@@ -84,6 +84,22 @@ harvest:
 		$(CONVERTER) -f cursor -t jsonl "$$src" "$$tgt.jsonl" && \
 		echo "OK $$tgt" >&2; \
 	done
+	@# --- Agy / Antigravity CLI (prefer current path over legacy path for duplicate IDs) ---
+	@for base in $(HOME)/.gemini/antigravity-cli/brain $(HOME)/.gemini/antigravity/brain; do \
+		find "$$base" -path '*/.system_generated/logs/transcript.jsonl' -type f 2>/dev/null | while read src; do \
+			session=$$(basename "$$(dirname "$$(dirname "$$(dirname "$$src")")")"); \
+			if [ "$$base" = "$(HOME)/.gemini/antigravity/brain" ] && \
+			   [ -f "$(HOME)/.gemini/antigravity-cli/brain/$$session/.system_generated/logs/transcript.jsonl" ]; then \
+				continue; \
+			fi; \
+			tgt=$(LOGS)/agy/default/$$session; \
+			[ -f "$$tgt.jsonl" ] && [ "$$tgt.jsonl" -nt "$$src" ] && continue; \
+			mkdir -p "$$(dirname "$$tgt")"; \
+			$(CONVERTER) -f agy "$$src" "$$tgt.md" && \
+			$(CONVERTER) -f agy -t jsonl "$$src" "$$tgt.jsonl" && \
+			echo "OK $$tgt" >&2; \
+		done; \
+	done
 report:
 	@python3 ai_report.py report --logs $(LOGS)
 

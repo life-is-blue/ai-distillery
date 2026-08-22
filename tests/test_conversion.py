@@ -1,6 +1,7 @@
-import unittest
+import json
 import subprocess
 import tempfile
+import unittest
 from pathlib import Path
 
 # Get project root directory
@@ -56,6 +57,29 @@ class TestAiLogConverter(unittest.TestCase):
         self.assertIn("Tool Call: `Shell`", output)
         self.assertNotIn("<user_query>", output)
         self.assertNotIn("<timestamp>", output)
+
+    def test_agy_conversion(self):
+        input_file = self.DATA_DIR / "agy_masked.jsonl"
+        output = self.run_convert(input_file)
+        self.assertIn("### User", output)
+        self.assertIn("Please inspect the repository", output)
+        self.assertIn("### Assistant", output)
+        self.assertIn("Tool Call: `list_dir`", output)
+        self.assertIn("Tool Result", output)
+        self.assertNotIn("ADDITIONAL_METADATA", output)
+        self.assertNotIn("internal metadata", output)
+        self.assertNotIn("checkpoint payload", output)
+
+    def test_agy_normalized_jsonl_preserves_structure(self):
+        input_file = self.DATA_DIR / "agy_masked.jsonl"
+        output = self.run_convert(input_file, args=["-f", "agy", "-t", "jsonl"])
+        messages = [json.loads(line) for line in output.splitlines()]
+
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "tool", "assistant"])
+        self.assertEqual(messages[0]["meta"]["timestamp"], "2026-08-22T07:20:01Z")
+        self.assertEqual(messages[1]["content"][0]["type"], "thought")
+        self.assertEqual(messages[1]["content"][1]["name"], "list_dir")
+        self.assertEqual(messages[2]["content"][0]["type"], "tool_result")
 
     def test_detect_format_skips_initial_metadata_lines(self):
         with tempfile.NamedTemporaryFile("w+", suffix=".jsonl", delete=False) as tf:

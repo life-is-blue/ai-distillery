@@ -83,6 +83,7 @@ Day 8: 新项目的 AI Agent 通过 git-library 读到这条 Gene → 主动遵�
 - **CodeBuddy**: 内部文本块清理及函数调用标记
 - **OpenAI Codex**: `response_item` 负载结构精准提取
 - **Cursor Agent**: `agent-transcripts` 会话解析，剥离 `<timestamp>`/`<user_query>` 包装标签
+- **Agy CLI**: 解析 Antigravity `transcript.jsonl`，保留最终回复、思考和工具轨迹
 
 ```bash
 # 基础转换
@@ -96,7 +97,7 @@ python3 ai_log_converter.py --slop input.jsonl output.md
 ```
 
 ```
--f FORMAT          强制格式: claude | gemini | codebuddy | codex | cursor (默认: 自动检测)
+-f FORMAT          强制格式: claude | gemini | codebuddy | codex | cursor | agy (默认: 自动检测)
 -t TYPE            输出: md | txt | jsonl (默认: md)
 --role ROLE        过滤: user | assistant | all (默认: all)
 --no-thoughts      去除推理/思考块
@@ -136,7 +137,7 @@ scripts/extract-gene.sh plan-before-act
 ai_report.py          流水线：9 个子命令，数据流转逻辑
 ai_engine.py          引擎：codex exec (128K) → call_llm fallback (auto-batch)
 ai_prompts.py         数据：所有 prompt 常量，纯文本无逻辑
-ai_log_converter.py   转换器：4 种格式 mapper，流式处理
+ai_log_converter.py   转换器：6 种格式 mapper，流式处理
 ```
 
 三文件按变更轴分离：引擎（低频）/ 提示词（中频）/ 流水线（高频）。
