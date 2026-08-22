@@ -24,22 +24,26 @@ graph LR
 
 ## 蒸馏管线
 
-每天由一台 leader 自动执行完整链路：
+每天由一台 leader 自动执行完整链路（`make leader`）：
 
 ```
-harvest → report → push → soul → dream → lessons → distill → gene-health → daily → sync-memory
-   │         │       │      │       │        │         │          │           │        │
-   │         │       │      │       │        │         │          │           │        └─ 推送到知识仓库
-   │         │       │      │       │        │         │          │           └─ 每日健康报告
-   │         │       │      │       │        │         │          └─ Gene 衰减追踪
-   │         │       │      │       │        │         └─ 蒸馏规则 → MEMORY.md
-   │         │       │      │       │        └─ 提取教训 → LESSONS.md
-   │         │       │      │       └─ 整合去重 SOUL.md
-   │         │       │      └─ 提取观察 → SOUL.md
-   │         │       └─ 推送到企微群
-   │         └─ 生成日报
-   └─ 采集日志
+pull-memory → harvest → sync-memory → report → push → soul → dream → lessons → distill → gene-health → daily → sync-memory
+     │           │           │           │       │      │       │        │         │          │           │        │
+     │           │           │           │       │      │       │        │         │          │           │        └─ 推送派生知识
+     │           │           │           │       │      │       │        │         │          │           └─ 每日健康报告
+     │           │           │           │       │      │       │        │         │          └─ Gene 衰减追踪
+     │           │           │           │       │      │       │        │         └─ 蒸馏规则 → MEMORY.md
+     │           │           │           │       │      │       │        └─ 提取教训 → LESSONS.md
+     │           │           │           │       │      │       └─ 整合去重 SOUL.md
+     │           │           │           │       │      └─ 提取观察 → SOUL.md
+     │           │           │           │       └─ 推送到企微群
+     │           │           │           └─ 生成日报
+     │           │           └─ 先推原始日志（避免后续失败时丢采集成果）
+     │           └─ 采集日志
+     └─ 拉取远端知识（有本地改动则拒绝，先 sync）
 ```
+
+collector 只跑前三步（`pull-memory → harvest → sync-memory`），不调 LLM。
 
 | 子命令 | 做什么 |
 |--------|--------|
@@ -50,8 +54,9 @@ harvest → report → push → soul → dream → lessons → distill → gene-
 | `lessons` | 经验教训提取：5 类（trap/toolchain/arch/correction/method），只留跨项目可迁移的错题本 |
 | `distill` | 蒸馏 SOUL + LESSONS → MEMORY.md 行为规则（MUST/MUST_NOT/PREFER/CONTEXT） |
 | `gene-health` | Gene 新鲜度衰减模型，registry 重建，晋升建议 |
-| `daily` | 每日健康报告：知识摘要、重复检测、规则新鲜度、链路健康、可操作建议（纯机械，不调 LLM） |
-| `sync-memory` | 提交并推送到远端知识仓库，供 git-library MCP 检索分发 |
+| `daily` | 每日健康报告：知识摘要、重复检测、规则新鲜度、链路健康、可操作建议（纯机械，不调 LLM）。`--strict` 在仍有未决发现时以非零码退出，供 CI/本地强制；cron 默认保持软报告 |
+| `interventions` | 挖掘用户接手 agent 的位置 → 自主边界基线（纯机械，不调 LLM，不进 cron）。产出 `reports/YYYY/MM/interventions-{range}.json` 为 SSOT 加渲染的 `.md`；只用各工具的硬标记，cursor/gemini 无标记则如实标注未覆盖，速率按工具分列以免被工具构成掩盖 |
+| `sync-memory` | 提交并推送到远端知识仓库，供 git-library MCP 检索分发；远端已推进时自动 rebase 重试 |
 
 多机部署采用“原始日志多写、派生知识单写”：每台 collector 只采集并同步唯一会话文件，唯一 leader 负责生成 SOUL、MEMORY、LESSONS、AGENTS 和报告。
 

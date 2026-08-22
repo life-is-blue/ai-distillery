@@ -39,6 +39,9 @@ scripts/extract-gene.sh plan-before-act
 | Target | What it does |
 |--------|-------------|
 | `make harvest` | Convert sessions from ~/.gemini (Gemini/Agy), ~/.claude-internal, ~/.tclaude, ~/.codebuddy, ~/.codex, ~/.cursor → ai-memory/ |
+| `make pull-memory` | Rebase-pull ai-memory; refuses if it has tracked local changes (sync first) |
+| `make collector` | Collector role: pull-memory → harvest → sync-memory. Raw logs only, no LLM |
+| `make leader` | Leader role: collector steps + full distillation chain. Exactly one machine runs this |
 | `make report` | Generate yesterday's daily report |
 | `make push` | Push latest report to WeCom webhook |
 | `make soul` | Full-context SOUL.md observation extraction (4 categories: Identity/Preferences/Patterns/Context) |
@@ -52,7 +55,7 @@ scripts/extract-gene.sh plan-before-act
 | `make setup` | New machine deployment: check Python, create .env, verify imports, install cron |
 | `make backfill-soul` | Rerun soul extraction on top 8 historical dates (for pk accumulation) |
 | `make test` | Run test suite |
-| `make install-cron` | Daily pipeline at 08:47: harvest → report → push → soul → dream → lessons → distill → gene-health → daily → sync-memory |
+| `make install-cron` | Install cron for one role: `CRON_ROLE=leader` (default, 08:47) or `collector` (07:47). Auto-resolves codex/python3/git/make paths into the cron PATH; override time via `CRON_HOUR`/`CRON_MINUTE` |
 | `make uninstall-cron` | Remove cron job |
 
 ## Architecture
@@ -72,6 +75,19 @@ ai-distillery/                       ai-memory/ (= ai-memory repo clone)
 
 Three files split by change-axis: engine (low freq) / prompts (mid freq) / pipeline (high freq).
 ai-memory/ IS the ai-memory repository — all cmd_* write directly, sync-memory commits and pushes.
+
+## Multi-machine roles
+
+Raw logs are written by many, derived knowledge by exactly one:
+
+- **collector** (any number of machines) — `pull-memory → harvest → sync-memory`. Each machine only
+  contributes uniquely-named raw session files, so concurrent writes never collide. No LLM needed.
+- **leader** (exactly one machine) — collector steps, then the full chain
+  (`report → push → soul → dream → lessons → distill → gene-health → daily`) and a final sync.
+  Independently completed stages still sync even if a later stage fails.
+
+Running two leaders would make them fight over the same derived files (SOUL/MEMORY/LESSONS/AGENTS).
+`sync-memory` retries a rebase when the remote advanced, which covers concurrent collectors.
 
 ## ai_report.py
 
