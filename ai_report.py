@@ -2486,6 +2486,22 @@ def _count_memory_rules(memory_path: Path) -> dict[str, int]:
     return counts
 
 
+def _soul_touched_on_day(soul_content: str, day: date) -> bool:
+    """True if soul produced observations on `day`.
+
+    soul tags new entries `<!-- new: DAY -->`. But `make leader` runs soul and
+    distill in the same chain, and distill rewrites `new:` → `absorbed: today`
+    (`_mark_absorbed_soul_entries`). So by the time `daily` runs, the day's
+    `new:` tags are gone. An `absorbed: DAY` tag means the entry was *both*
+    produced and consumed that day — the normal case under the leader chain —
+    so it must still count as "soul ran that day".
+    """
+    return (
+        f"<!-- new: {day} -->" in soul_content
+        or f"<!-- absorbed: {day} -->" in soul_content
+    )
+
+
 def _check_rule_freshness(memory_path: Path, soul_path: Path) -> list[tuple[str, str]]:
     """Check which MEMORY.md rules have recent evidence in SOUL.md (last 30 days).
 
@@ -2577,7 +2593,9 @@ def cmd_daily(args):
         sc = soul_path.read_text(encoding="utf-8")
         soul_total = len(re.findall(r'^- ', sc, re.M))  # count bullet entries
         soul_unabsorbed = sc.count("<!-- new:")  # new entries not yet absorbed
-        soul_today = len(re.findall(rf'<!-- new: {target_date} -->', sc))
+        # Same leader-chain issue as _soul_touched_on_day: distill rewrites
+        # new: → absorbed: same day, so "今日 +N" must count absorbed: today too.
+        soul_today = len(re.findall(rf'<!-- (?:new|absorbed): {target_date} -->', sc))
     # LESSONS.md
     les_total = les_absorbed = les_unabsorbed = les_review = 0
     if lessons_path.exists():
@@ -2714,7 +2732,7 @@ def cmd_daily(args):
         day = target_date - timedelta(days=d)
         n_sessions = len(find_sessions(logs_dir, day))
         has_report = (_report_month_dir(reports_dir, day) / f"{day}.md").exists()
-        has_soul = f"<!-- new: {day} -->" in soul_content
+        has_soul = _soul_touched_on_day(soul_content, day)
         n_lessons = len(re.findall(rf'>\s*{day}\s*\|', lessons_content))
         s7.append(f"| {day} | {n_sessions} | {'✓' if has_report else '—'} | {'✓' if has_soul else '—'} | +{n_lessons} |")
     sections.append("\n".join(s7))

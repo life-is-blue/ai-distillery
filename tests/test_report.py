@@ -40,6 +40,7 @@ from ai_report import (
     _rebuild_memory,
     find_sessions,
     _check_rule_freshness,
+    _soul_touched_on_day,
     _report_month_dir,
 )
 from ai_prompts import MEMORY_SKELETON
@@ -818,6 +819,32 @@ class TestCheckRuleFreshness(unittest.TestCase):
             # neither matches a recent pk's words → both stale, no crash
             self.assertEqual(results["Rule with id only <!-- id: abc12345 -->"], "stale")
             self.assertEqual(results["Rule with broken pk <!-- pk: -->"], "stale")
+
+
+class TestSoulTouchedOnDay(unittest.TestCase):
+    """Regression: `make leader` runs soul then distill in the same chain, and
+    distill rewrites `new: DAY` → `absorbed: DAY`. The daily report's section 7
+    must still show `✓` for a day whose entries were produced *and* absorbed
+    that day — otherwise SOUL shows `—` forever under the normal chain."""
+
+    def test_new_tag_counts(self):
+        self.assertTrue(_soul_touched_on_day(
+            "- entry <!-- new: 2026-08-22 -->", date.fromisoformat("2026-08-22")))
+
+    def test_absorbed_tag_counts_when_new_was_rewritten(self):
+        # distill rewrote new: → absorbed: same day; soul did run that day
+        self.assertTrue(_soul_touched_on_day(
+            "- entry <!-- absorbed: 2026-08-22 -->", date.fromisoformat("2026-08-22")))
+
+    def test_different_day_does_not_count(self):
+        self.assertFalse(_soul_touched_on_day(
+            "- entry <!-- absorbed: 2026-08-21 -->", date.fromisoformat("2026-08-22")))
+        self.assertFalse(_soul_touched_on_day(
+            "- entry <!-- new: 2026-08-21 -->", date.fromisoformat("2026-08-22")))
+
+    def test_no_tags_does_not_count(self):
+        self.assertFalse(_soul_touched_on_day(
+            "- entry with no lifecycle tags", date.fromisoformat("2026-08-22")))
 
 
 class TestCmdDistillPkAttach(unittest.TestCase):
