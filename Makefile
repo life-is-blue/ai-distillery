@@ -126,8 +126,15 @@ sync-memory:
 	@python3 ai_report.py sync-memory --logs $(LOGS)
 
 install-cron:
-	@(crontab -l 2>/dev/null | grep -v 'ai-distillery-cron'; echo "47 8 * * * export PATH=/data/home/bluejqhuang/.nvm/versions/node/v24.14.1/bin:/usr/bin:/bin:\$$PATH; cd $(CURDIR) && cd $(LOGS) && git pull --rebase --quiet 2>/dev/null; cd $(CURDIR); { make harvest && make report && make push && make soul && make dream && make lessons && make distill && make gene-health && make daily; } >> /tmp/ai-report.log 2>&1; make sync-memory >> /tmp/ai-report.log 2>&1 # ai-distillery-cron") | crontab -
-	@echo "Cron installed: nvm/codex PATH injected; pipeline + sync both log to /tmp/ai-report.log"
+	@runtime_path="$$PATH"; \
+	codex_bin=$$(command -v codex 2>/dev/null || true); \
+	(crontab -l 2>/dev/null | grep -v 'ai-distillery-cron'; \
+	 printf '%s\n' "47 8 * * * export PATH=$$runtime_path; cd '$(LOGS)' && git pull --rebase --quiet 2>/dev/null; cd '$(CURDIR)'; { make harvest && make report && make push && make soul && make dream && make lessons && make distill && make gene-health && make daily; } >> /tmp/ai-report.log 2>&1; make sync-memory >> /tmp/ai-report.log 2>&1 # ai-distillery-cron") | crontab -; \
+	if [ -n "$$codex_bin" ]; then \
+		echo "Cron installed: current PATH captured (codex: $$codex_bin); logs: /tmp/ai-report.log"; \
+	else \
+		echo "Cron installed: current PATH captured; codex not found, so configure LLM_API_KEY fallback; logs: /tmp/ai-report.log"; \
+	fi
 
 uninstall-cron:
 	@crontab -l 2>/dev/null | grep -v 'ai-distillery-cron' | crontab -

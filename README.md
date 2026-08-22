@@ -120,6 +120,8 @@ make install-cron
 scripts/extract-gene.sh plan-before-act
 ```
 
+`make install-cron` 会把安装时的 `PATH` 写入 cron，因此 nvm、Codex 等用户级命令无需配置机器专属路径。安装或切换 Codex 后重新执行一次该命令即可更新；若未安装 Codex，则需在 `.env` 配置 `LLM_API_KEY` 作为 fallback。
+
 ## 架构
 
 ```
