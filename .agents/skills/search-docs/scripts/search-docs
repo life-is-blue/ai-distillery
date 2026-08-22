@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_SOURCE" ]]; do
+  source_dir="$(cd -P -- "$(dirname -- "$SCRIPT_SOURCE")" && pwd)"
+  SCRIPT_SOURCE="$(readlink -- "$SCRIPT_SOURCE")"
+  [[ "$SCRIPT_SOURCE" == /* ]] || SCRIPT_SOURCE="${source_dir}/${SCRIPT_SOURCE}"
+done
+SCRIPT_DIR="$(cd -P -- "$(dirname -- "$SCRIPT_SOURCE")" && pwd)"
+SKILL_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+CONTRACT_PATH="${SKILL_DIR}/references/capability-contract.json"
+PROVENANCE_PATH="${SKILL_DIR}/references/capability-provenance.json"
 DEFAULT_URL="https://mcp.100100086.xyz"
 GIT_LIBRARY_URL="${GIT_LIBRARY_URL:-$DEFAULT_URL}"
 
@@ -13,11 +23,28 @@ else
   LIBRARIES_TTL_DAYS="1"
 fi
 LIBRARIES_TTL_SECONDS=$((LIBRARIES_TTL_DAYS * 86400))
-CLI_AMBIGUITY_MARGIN_RAW="${GIT_LIBRARY_CLI_AMBIGUITY_MARGIN:-0.12}"
+if [[ ! -f "$CONTRACT_PATH" ]]; then
+  echo "search-docs contract is missing: ${CONTRACT_PATH}" >&2
+  exit 1
+fi
+if command -v python3 >/dev/null 2>&1; then
+  contract_ambiguity_margin="$(python3 - "$CONTRACT_PATH" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["cli_defaults"]["ambiguity_margin"])
+PY
+)"
+elif command -v jq >/dev/null 2>&1; then
+  contract_ambiguity_margin="$(jq -er '.cli_defaults.ambiguity_margin' "$CONTRACT_PATH")"
+else
+  echo "search-docs requires python3 or jq to read its capability contract." >&2
+  exit 1
+fi
+CLI_AMBIGUITY_MARGIN_RAW="${GIT_LIBRARY_CLI_AMBIGUITY_MARGIN:-$contract_ambiguity_margin}"
+# Ambiguity margin for cross-library routing (default comes from the contract).
 if [[ "$CLI_AMBIGUITY_MARGIN_RAW" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]; then
   CLI_AMBIGUITY_MARGIN="$CLI_AMBIGUITY_MARGIN_RAW"
 else
-  CLI_AMBIGUITY_MARGIN="0.12"
+  CLI_AMBIGUITY_MARGIN="$contract_ambiguity_margin"
 fi
 
 has_cmd() {
@@ -30,6 +57,8 @@ search-docs: lightweight CLI for git-library HTTP API
 
 Usage:
   search-docs health [--url URL]
+  search-docs version
+  search-docs doctor [--offline]
   search-docs libraries [--refresh] [--fresh-for-query QUERY] [--url URL]
   search-docs search <query...> [--library LIB_ID] [--limit N] [--offset N] [--fields CSV] [--catalog-mode topic|full|none] [--url URL]
   search-docs read <LIB_ID/PATH | LIB_ID PATH> [--url URL]
@@ -38,6 +67,7 @@ Usage:
 
 Notes:
   - 'health' returns remote status and local dependency checks.
+  - 'doctor --offline' verifies the bundled contract without network access.
   - 'libraries' caches by endpoint URL (default TTL: 1 day).
   - use --refresh to force update; use --fresh-for-query for freshness-sensitive questions.
   - 'search' may add presentation-only cli_hint when jq is available.
@@ -48,6 +78,8 @@ Environment:
 
 Examples:
   search-docs libraries
+  search-docs version
+  search-docs doctor --offline
   search-docs libraries --refresh
   search-docs libraries --fresh-for-query "最新发布的命令"
   search-docs search "GitHub Actions migrate to CNB" --library cnb-feedback
@@ -56,6 +88,57 @@ Examples:
   search-docs manifest claude-code
   search-docs recent --library openai-codex --days 3
 USAGE
+}
+
+require_contract_runtime() {
+  if ! has_cmd python3; then
+    echo "Missing dependency: python3 (required for contract diagnostics)." >&2
+    exit 1
+  fi
+  if [[ ! -f "$CONTRACT_PATH" || ! -f "$PROVENANCE_PATH" ]]; then
+    echo "search-docs contract bundle is incomplete: ${SKILL_DIR}" >&2
+    exit 1
+  fi
+}
+
+emit_version() {
+  require_contract_runtime
+  python3 - "$CONTRACT_PATH" "$PROVENANCE_PATH" <<'PY'
+import json, sys
+contract = json.load(open(sys.argv[1], encoding="utf-8"))
+provenance = json.load(open(sys.argv[2], encoding="utf-8"))
+print(f"search-docs {contract['version']} ({contract['id']}, {provenance['sha256'][:12]})")
+PY
+}
+
+emit_doctor() {
+  require_contract_runtime
+  python3 - "$CONTRACT_PATH" "$PROVENANCE_PATH" "$SKILL_DIR" <<'PY'
+import hashlib, json, pathlib, sys
+contract_path = pathlib.Path(sys.argv[1])
+provenance_path = pathlib.Path(sys.argv[2])
+skill_dir = pathlib.Path(sys.argv[3]).resolve()
+contract = json.loads(contract_path.read_text(encoding="utf-8"))
+provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+actual = hashlib.sha256(contract_path.read_bytes()).hexdigest()
+ok = (
+    actual == provenance.get("sha256")
+    and contract.get("id") == provenance.get("contract_id")
+    and contract.get("version") == provenance.get("contract_version")
+)
+print(json.dumps({
+    "status": "ok" if ok else "drift",
+    "skill_dir": str(skill_dir),
+    "contract": {
+        "id": contract.get("id"),
+        "version": contract.get("version"),
+        "sha256": actual,
+        "expected_sha256": provenance.get("sha256"),
+        "upstream_commit": provenance.get("upstream_commit"),
+    },
+}, ensure_ascii=False, indent=2))
+raise SystemExit(0 if ok else 1)
+PY
 }
 
 require_arg() {
@@ -282,6 +365,29 @@ case "$cmd" in
       esac
     done
     emit_health "$GIT_LIBRARY_URL" | pretty_json
+    ;;
+
+  version)
+    if [[ $# -ne 0 ]]; then
+      echo "version accepts no arguments." >&2
+      exit 1
+    fi
+    emit_version
+    ;;
+
+  doctor)
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --offline)
+          shift
+          ;;
+        *)
+          echo "Unknown option for doctor: $1" >&2
+          exit 1
+          ;;
+      esac
+    done
+    emit_doctor
     ;;
 
   libraries)

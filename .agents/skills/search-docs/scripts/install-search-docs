@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source_skill="$(cd -- "${script_dir}/.." && pwd)"
+target="codex"
+skill_root=""
+bin_dir="${SEARCH_DOCS_BIN_DIR:-$HOME/.local/bin}"
+check_only=false
+
+usage() {
+  cat <<'USAGE'
+Usage: install-search-docs [--target codex|claude|cursor|gemini|agents|codebuddy|copilot|hermes|antigravity] [--skill-root DIR] [--bin-dir DIR] [--check]
+
+Installs the complete search-docs Skill and links its CLI. --check is read-only.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --target)
+      [[ $# -ge 2 ]] || { echo "Missing value for --target" >&2; exit 2; }
+      target="$2"
+      shift 2
+      ;;
+    --skill-root)
+      [[ $# -ge 2 ]] || { echo "Missing value for --skill-root" >&2; exit 2; }
+      skill_root="$2"
+      shift 2
+      ;;
+    --bin-dir)
+      [[ $# -ge 2 ]] || { echo "Missing value for --bin-dir" >&2; exit 2; }
+      bin_dir="$2"
+      shift 2
+      ;;
+    --check)
+      check_only=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+case "$target" in
+  codex)
+    skill_root="${skill_root:-${CODEX_HOME:-$HOME/.codex}/skills}"
+    ;;
+  claude)
+    skill_root="${skill_root:-$HOME/.claude/skills}"
+    ;;
+  cursor)
+    skill_root="${skill_root:-$HOME/.cursor/skills}"
+    ;;
+  gemini)
+    skill_root="${skill_root:-$HOME/.gemini/skills}"
+    ;;
+  agents)
+    skill_root="${skill_root:-$HOME/.agents/skills}"
+    ;;
+  codebuddy)
+    skill_root="${skill_root:-$HOME/.codebuddy/skills}"
+    ;;
+  copilot)
+    skill_root="${skill_root:-$HOME/.copilot/skills}"
+    ;;
+  hermes)
+    skill_root="${skill_root:-$HOME/.hermes/skills}"
+    ;;
+  antigravity)
+    skill_root="${skill_root:-$HOME/.gemini/antigravity/skills}"
+    ;;
+  *)
+    echo "Unsupported target: $target (expected codex, claude, cursor, gemini, agents, codebuddy, copilot, hermes, or antigravity)" >&2
+    exit 2
+    ;;
+esac
+
+installed_skill="${skill_root}/search-docs"
+target_cli="${bin_dir}/search-docs"
+
+verify_bundle() {
+  local bundle="$1"
+  python3 - "$bundle" <<'PY'
+import hashlib, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+contract = root / "references" / "capability-contract.json"
+provenance = root / "references" / "capability-provenance.json"
+required = [root / "SKILL.md", root / "scripts" / "search-docs", contract, provenance]
+if any(not path.is_file() for path in required):
+    raise SystemExit("search-docs bundle is incomplete")
+metadata = json.loads(provenance.read_text(encoding="utf-8"))
+actual = hashlib.sha256(contract.read_bytes()).hexdigest()
+if actual != metadata.get("sha256"):
+    raise SystemExit("search-docs contract checksum drift")
+PY
+}
+
+command -v python3 >/dev/null 2>&1 || {
+  echo "Missing dependency: python3 (required for installation verification)." >&2
+  exit 1
+}
+verify_bundle "$source_skill"
+
+if [[ "$check_only" == true ]]; then
+  if [[ ! -d "$installed_skill" ]] || ! diff -qr "$source_skill" "$installed_skill" >/dev/null; then
+    echo "search-docs installation drift: ${installed_skill}" >&2
+    exit 1
+  fi
+  if [[ ! -L "$target_cli" || "$(readlink -f "$target_cli")" != "$(readlink -f "$installed_skill/scripts/search-docs")" ]]; then
+    echo "search-docs CLI link drift: ${target_cli}" >&2
+    exit 1
+  fi
+  verify_bundle "$installed_skill"
+  echo "search-docs installation ok: ${installed_skill}"
+  exit 0
+fi
+
+mkdir -p "$skill_root" "$bin_dir"
+
+if [[ "$(readlink -f "$source_skill")" == "$(readlink -f "$installed_skill" 2>/dev/null || true)" ]]; then
+  verify_bundle "$installed_skill"
+  ln -sfn "$installed_skill/scripts/search-docs" "$target_cli"
+  echo "search-docs already installed: ${installed_skill}"
+  exit 0
+fi
+
+stage="$(mktemp -d "${skill_root}/.search-docs-stage.XXXXXX")"
+backup="${skill_root}/.search-docs-backup.$$"
+cleanup() {
+  [[ ! -d "$stage" ]] || rm -rf -- "$stage"
+}
+trap cleanup EXIT
+
+cp -R "$source_skill/." "$stage/"
+chmod 755 "$stage/scripts/search-docs" "$stage/scripts/install-search-docs"
+verify_bundle "$stage"
+
+if [[ -e "$installed_skill" || -L "$installed_skill" ]]; then
+  mv -- "$installed_skill" "$backup"
+fi
+if ! mv -- "$stage" "$installed_skill"; then
+  [[ ! -e "$backup" ]] || mv -- "$backup" "$installed_skill"
+  exit 1
+fi
+ln -sfn "$installed_skill/scripts/search-docs" "$target_cli"
+[[ ! -e "$backup" ]] || rm -rf -- "$backup"
+trap - EXIT
+
+echo "search-docs installed: ${installed_skill}"
+echo "search-docs CLI: ${target_cli}"

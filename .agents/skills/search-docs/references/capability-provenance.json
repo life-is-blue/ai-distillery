@@ -1,0 +1,10 @@
+{
+  "contract_id": "search-docs.v1",
+  "contract_version": "1.0.0",
+  "upstream_repository": "https://cnb.cool/ai-alchemy-factory/git-library",
+  "upstream_path": "contracts/capabilities/search-docs.v1.json",
+  "upstream_commit": "10ef2e8fe070ef91cf99c5fef7475ae804d309b5",
+  "sha256": "f9ef28280b8606ea796486a0a5962f85905af78dd900560d3b38efc5acf5e112",
+  "license": "MIT",
+  "license_source": "README.md"
+}

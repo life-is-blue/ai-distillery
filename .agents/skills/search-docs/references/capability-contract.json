@@ -1,0 +1,36 @@
+{
+  "id": "search-docs.v1",
+  "version": "1.0.0",
+  "tool_surface": [
+    "list_libraries",
+    "search_library",
+    "read_document",
+    "get_library_manifest"
+  ],
+  "workflow_levels": [
+    "navigate",
+    "search",
+    "probe",
+    "fallback"
+  ],
+  "confidence": {
+    "high_min_display_score": 0.7,
+    "medium_min_display_score": 0.45
+  },
+  "ambiguity_gate": {
+    "max_top1_top2_gap": 0.2,
+    "min_overlap": 0.45
+  },
+  "budgets": {
+    "default_cli_calls": 5,
+    "hard_cap_cli_calls": 8,
+    "max_query_variants": 2,
+    "max_cross_library_fallback": 1
+  },
+  "cli_defaults": {
+    "ambiguity_margin": 0.2
+  },
+  "notes": {
+    "cli_hint_source": "presentation_only"
+  }
+}
