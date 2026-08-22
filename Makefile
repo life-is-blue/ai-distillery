@@ -126,14 +126,25 @@ sync-memory:
 	@python3 ai_report.py sync-memory --logs $(LOGS)
 
 install-cron:
-	@runtime_path="$$PATH"; \
-	codex_bin=$$(command -v codex 2>/dev/null || true); \
-	(crontab -l 2>/dev/null | grep -v 'ai-distillery-cron'; \
+	@runtime_path="/usr/local/bin:/usr/bin:/bin"; \
+	codex_bin=""; \
+	for tool in codex python3 git make; do \
+		tool_bin=$$(command -v "$$tool" 2>/dev/null || true); \
+		[ "$$tool" != codex ] || codex_bin="$$tool_bin"; \
+		[ -z "$$tool_bin" ] && continue; \
+		tool_dir=$$(dirname "$$tool_bin"); \
+		case ":$$runtime_path:" in *":$$tool_dir:"*) ;; *) runtime_path="$$tool_dir:$$runtime_path" ;; esac; \
+	done; \
+	if ! (crontab -l 2>/dev/null | grep -v 'ai-distillery-cron'; \
 	 printf '%s\n' "47 8 * * * export PATH=$$runtime_path; cd '$(LOGS)' && git pull --rebase --quiet 2>/dev/null; cd '$(CURDIR)'; { make harvest && make report && make push && make soul && make dream && make lessons && make distill && make gene-health && make daily; } >> /tmp/ai-report.log 2>&1; make sync-memory >> /tmp/ai-report.log 2>&1 # ai-distillery-cron") | crontab -; \
+	then \
+		echo "ERROR: failed to install cron" >&2; \
+		exit 1; \
+	fi; \
 	if [ -n "$$codex_bin" ]; then \
-		echo "Cron installed: current PATH captured (codex: $$codex_bin); logs: /tmp/ai-report.log"; \
+		echo "Cron installed: tool PATH resolved (codex: $$codex_bin); logs: /tmp/ai-report.log"; \
 	else \
-		echo "Cron installed: current PATH captured; codex not found, so configure LLM_API_KEY fallback; logs: /tmp/ai-report.log"; \
+		echo "Cron installed: tool PATH resolved; codex not found, so configure LLM_API_KEY fallback; logs: /tmp/ai-report.log"; \
 	fi
 
 uninstall-cron:

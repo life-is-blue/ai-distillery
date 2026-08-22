@@ -22,6 +22,7 @@ class InstallCronTests(unittest.TestCase):
                 "  [ ! -f \"$CRON_STATE\" ] || cat \"$CRON_STATE\"\n"
                 "else\n"
                 "  cat > \"$CRON_STATE\"\n"
+                "  [ \"$CRON_FAIL\" != 1 ]\n"
                 "fi\n"
             )
             fake_codex.write_text("#!/bin/sh\nexit 0\n")
@@ -51,9 +52,21 @@ class InstallCronTests(unittest.TestCase):
 
             installed = cron_state.read_text()
             self.assertEqual(installed.count("# ai-distillery-cron"), 1)
-            self.assertIn(f"export PATH={runtime_path};", installed)
+            expected_path = f"{tmp_path}:/usr/local/bin:/usr/bin:/bin"
+            self.assertIn(f"export PATH={expected_path};", installed)
             self.assertIn(str(fake_codex), result.stdout)
             self.assertNotIn("/data/home/", installed)
+
+            env["CRON_FAIL"] = "1"
+            failed = subprocess.run(
+                ["make", "install-cron"],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("ERROR: failed to install cron", failed.stderr)
 
 
 if __name__ == "__main__":
