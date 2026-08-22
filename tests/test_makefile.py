@@ -114,7 +114,13 @@ class InstallCronTests(unittest.TestCase):
             self.assertIn(str(fake_codex), result.stdout)
             self.assertIn("47 8 * * *", installed)
             self.assertIn("make leader", installed)
-            self.assertNotIn("/data/home/", installed)
+            # The PATH must be resolved from the live environment, not a
+            # hardcoded author-machine path. Scope this to the PATH segment:
+            # the cron line always contains `cd '$(CURDIR)'`, which legitimately
+            # holds an absolute repo path (and would false-positive on any host
+            # whose $HOME lives under the checked prefix).
+            path_segment = installed.split("export PATH=", 1)[1].split(";", 1)[0]
+            self.assertEqual(path_segment, expected_path)
 
             subprocess.run(
                 ["make", "install-cron", "CRON_ROLE=collector"],
