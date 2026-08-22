@@ -1,11 +1,68 @@
+import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class AgyHarvestTests(unittest.TestCase):
+    @staticmethod
+    def _transcript(home: Path, root: str, session: str) -> Path:
+        path = home / ".gemini" / root / "brain" / session / ".system_generated" / "logs" / "transcript.jsonl"
+        path.parent.mkdir(parents=True)
+        return path
+
+    @staticmethod
+    def _agy_line(content: str) -> str:
+        return json.dumps({
+            "type": "PLANNER_RESPONSE",
+            "content": content,
+            "created_at": "2026-08-22T07:20:04Z",
+            "source": "MODEL",
+            "status": "DONE",
+            "step_index": 1,
+        }) + "\n"
+
+    def test_harvests_both_roots_idempotently_and_prefers_current_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home = tmp_path / "home"
+            logs = tmp_path / "logs"
+            current = self._transcript(home, "antigravity-cli", "shared-session")
+            duplicate = self._transcript(home, "antigravity", "shared-session")
+            legacy = self._transcript(home, "antigravity", "legacy-session")
+            current.write_text(self._agy_line("current source"))
+            duplicate.write_text(self._agy_line("legacy duplicate"))
+            legacy.write_text(self._agy_line("legacy source"))
+            for source in (current, duplicate, legacy):
+                os.utime(source, (1, 1))
+
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            command = ["make", "harvest", f"LOGS={logs}"]
+            subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, check=True)
+
+            shared_output = logs / "agy" / "default" / "shared-session.jsonl"
+            legacy_output = logs / "agy" / "default" / "legacy-session.jsonl"
+            self.assertIn("current source", shared_output.read_text())
+            self.assertNotIn("legacy duplicate", shared_output.read_text())
+            self.assertIn("legacy source", legacy_output.read_text())
+            self.assertTrue(shared_output.with_suffix(".md").exists())
+
+            first_mtime = shared_output.stat().st_mtime_ns
+            subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, check=True)
+            self.assertEqual(shared_output.stat().st_mtime_ns, first_mtime)
+
+            current.write_text(self._agy_line("updated current source"))
+            newer = max(time.time_ns(), first_mtime + 2_000_000_000)
+            os.utime(current, ns=(newer, newer))
+            subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, check=True)
+            self.assertIn("updated current source", shared_output.read_text())
 
 
 class InstallCronTests(unittest.TestCase):

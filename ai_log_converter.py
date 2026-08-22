@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-ai-distillery / ai-log-converter - v2.3.0
+ai-distillery / ai-log-converter - v2.4.0
 "Talk is cheap. Show me the code."
 
-Convert AI conversation logs (Claude, Gemini, CodeBuddy, Codex, Cursor) to readable formats.
+Convert AI conversation logs (Claude, Gemini, CodeBuddy, Codex, Cursor, Agy) to readable formats.
 
 Features:
 - Multi-format output: Markdown (md), Plain Text (txt), Normalized JSONL (jsonl)
@@ -13,7 +13,7 @@ Features:
 - Zero dependencies. Unix pipe friendly.
 """
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 import argparse
 import json
@@ -182,7 +182,68 @@ def map_cursor(entry: dict) -> Generator[dict, None, None]:
         elif t == "tool_result": res.append({"type": "tool_result", "content": b.get("content")})
     if res: yield {"role": role, "content": res, "meta": {"timestamp": entry.get("timestamp")}}
 
-MAPPER_REGISTRY = {"claude": map_claude, "gemini": map_gemini, "codebuddy": map_codebuddy, "codex": map_codex, "cursor": map_cursor}
+def _clean_agy_user(text: str) -> str:
+    request = re.search(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", text, flags=re.DOTALL)
+    if request:
+        return Harness.clean(request.group(1))
+    text = re.sub(r"<ADDITIONAL_METADATA>.*?</ADDITIONAL_METADATA>", "", text, flags=re.DOTALL)
+    return Harness.clean(text)
+
+
+AGY_TOOL_RESULTS = {
+    "ASK_QUESTION", "CODE_ACTION", "ERROR_MESSAGE", "GENERIC", "GREP_SEARCH",
+    "LIST_DIRECTORY", "MCP_TOOL", "READ_URL_CONTENT", "RUN_COMMAND", "SEARCH_WEB",
+    "VIEW_FILE",
+}
+
+
+def map_agy(entry: dict) -> Generator[dict, None, None]:
+    etype = entry.get("type", "")
+    ts = entry.get("created_at")
+    if etype == "USER_INPUT":
+        content = entry.get("content")
+        if isinstance(content, str):
+            text = _clean_agy_user(content)
+            if text:
+                yield {"role": "user", "content": [{"type": "text", "text": text}], "meta": {"timestamp": ts}}
+        return
+
+    if etype == "PLANNER_RESPONSE":
+        res = []
+        content = entry.get("content")
+        if isinstance(content, str):
+            text = Harness.clean(content)
+            if text:
+                res.append({"type": "text", "text": text})
+        thinking = entry.get("thinking")
+        if isinstance(thinking, str) and thinking.strip():
+            res.append({"type": "thought", "text": thinking.strip()})
+        for call in entry.get("tool_calls") or []:
+            if not isinstance(call, dict) or not call.get("name"):
+                continue
+            res.append({"type": "tool_call", "name": call["name"], "input": call.get("args", {})})
+        if res:
+            yield {"role": "assistant", "content": res, "meta": {"timestamp": ts}}
+        return
+
+    if etype in AGY_TOOL_RESULTS:
+        content = entry.get("content")
+        if content not in (None, "", [], {}):
+            yield {
+                "role": "tool",
+                "content": [{"type": "tool_result", "name": etype.lower(), "content": content}],
+                "meta": {"timestamp": ts},
+            }
+
+
+MAPPER_REGISTRY = {
+    "claude": map_claude,
+    "gemini": map_gemini,
+    "codebuddy": map_codebuddy,
+    "codex": map_codex,
+    "cursor": map_cursor,
+    "agy": map_agy,
+}
 DETECT_PEEK_LIMIT = 50
 
 # === IO and Detect ===
@@ -210,6 +271,8 @@ def detect_format(samples: Iterable[dict]) -> Optional[str]:
         if not isinstance(sample, dict) or is_metadata_entry(sample):
             continue
 
+        if sample.get("type") in ("USER_INPUT", "PLANNER_RESPONSE") and "created_at" in sample:
+            return "agy"
         if "type" in sample and ("messageId" in sample or "message" in sample or "snapshot" in sample):
             return "claude"
         if "messages" in sample or sample.get("type") in ("user", "model", "gemini"):
