@@ -1,4 +1,4 @@
-.PHONY: test clean harvest report push soul dream distill lessons gene-health daily interventions sync-memory install-cron uninstall-cron backfill-soul setup
+.PHONY: test clean harvest pull-memory collector leader report push soul dream distill lessons gene-health daily interventions sync-memory install-cron uninstall-cron backfill-soul setup
 
 LOGS     := $(CURDIR)/ai-memory
 CONVERTER := python3 ai_log_converter.py
@@ -84,10 +84,6 @@ harvest:
 		$(CONVERTER) -f cursor -t jsonl "$$src" "$$tgt.jsonl" && \
 		echo "OK $$tgt" >&2; \
 	done
-	@# --- Auto-sync: commit+push new harvested sessions to ai-memory ---
-	@cd $(LOGS) && git add -A && \
-		(git diff --cached --quiet || (git commit -m "harvest: $$(date +%Y-%m-%d\ %H:%M) on $$(hostname -s)" --quiet && git push --quiet && echo "OK harvest synced to ai-memory" >&2)) || true
-
 report:
 	@python3 ai_report.py report --logs $(LOGS)
 
@@ -125,8 +121,46 @@ interventions:
 sync-memory:
 	@python3 ai_report.py sync-memory --logs $(LOGS)
 
+pull-memory:
+	@test -d '$(LOGS)/.git' || { echo "ERROR: $(LOGS) is not a git repository" >&2; exit 1; }
+	@if ! git -C '$(LOGS)' diff --quiet || ! git -C '$(LOGS)' diff --cached --quiet; then \
+		echo "ERROR: ai-memory has tracked local changes; sync or resolve them before pulling" >&2; \
+		exit 1; \
+	fi
+	@git -C '$(LOGS)' pull --rebase --quiet
+
+# Collectors may run on many machines: gather uniquely named raw sessions only.
+collector:
+	@$(MAKE) pull-memory
+	@$(MAKE) harvest
+	@$(MAKE) sync-memory
+
+# Exactly one leader generates shared derived knowledge. Raw logs are synced
+# first; independently completed derived stages are synced even if a later one
+# fails, preserving the existing fail-visible cron behavior.
+leader:
+	@$(MAKE) pull-memory
+	@$(MAKE) harvest
+	@$(MAKE) sync-memory
+	@pipeline_rc=0; \
+	{ $(MAKE) report && $(MAKE) push && $(MAKE) soul && $(MAKE) dream && \
+	  $(MAKE) lessons && $(MAKE) distill && $(MAKE) gene-health && $(MAKE) daily; \
+	} || pipeline_rc=$$?; \
+	$(MAKE) sync-memory || exit $$?; \
+	exit $$pipeline_rc
+
+CRON_ROLE ?= leader
+CRON_HOUR ?= $(if $(filter collector,$(CRON_ROLE)),7,8)
+CRON_MINUTE ?= 47
+
 install-cron:
-	@runtime_path="/usr/local/bin:/usr/bin:/bin"; \
+	@cron_role='$(CRON_ROLE)'; cron_hour='$(CRON_HOUR)'; cron_minute='$(CRON_MINUTE)'; \
+	case "$$cron_role" in leader|collector) ;; *) echo "ERROR: CRON_ROLE must be leader or collector" >&2; exit 2 ;; esac; \
+	case "$$cron_hour" in ''|*[!0-9]*) echo "ERROR: CRON_HOUR must be 0-23" >&2; exit 2 ;; esac; \
+	case "$$cron_minute" in ''|*[!0-9]*) echo "ERROR: CRON_MINUTE must be 0-59" >&2; exit 2 ;; esac; \
+	[ "$$cron_hour" -le 23 ] || { echo "ERROR: CRON_HOUR must be 0-23" >&2; exit 2; }; \
+	[ "$$cron_minute" -le 59 ] || { echo "ERROR: CRON_MINUTE must be 0-59" >&2; exit 2; }; \
+	runtime_path="/usr/local/bin:/usr/bin:/bin"; \
 	codex_bin=""; \
 	for tool in codex python3 git make; do \
 		tool_bin=$$(command -v "$$tool" 2>/dev/null || true); \
@@ -136,15 +170,16 @@ install-cron:
 		case ":$$runtime_path:" in *":$$tool_dir:"*) ;; *) runtime_path="$$tool_dir:$$runtime_path" ;; esac; \
 	done; \
 	if ! (crontab -l 2>/dev/null | grep -v 'ai-distillery-cron'; \
-	 printf '%s\n' "47 8 * * * export PATH=$$runtime_path; cd '$(LOGS)' && git pull --rebase --quiet 2>/dev/null; cd '$(CURDIR)'; { make harvest && make report && make push && make soul && make dream && make lessons && make distill && make gene-health && make daily; } >> /tmp/ai-report.log 2>&1; make sync-memory >> /tmp/ai-report.log 2>&1 # ai-distillery-cron") | crontab -; \
+	 printf '%s %s * * * export PATH=%s; cd '\''%s'\'' && make %s >> /tmp/ai-report.log 2>&1 # ai-distillery-cron\n' \
+	 "$$cron_minute" "$$cron_hour" "$$runtime_path" '$(CURDIR)' "$$cron_role") | crontab -; \
 	then \
 		echo "ERROR: failed to install cron" >&2; \
 		exit 1; \
 	fi; \
 	if [ -n "$$codex_bin" ]; then \
-		echo "Cron installed: tool PATH resolved (codex: $$codex_bin); logs: /tmp/ai-report.log"; \
+		echo "Cron installed: $$cron_role at $$cron_hour:$$cron_minute, tool PATH resolved (codex: $$codex_bin); logs: /tmp/ai-report.log"; \
 	else \
-		echo "Cron installed: tool PATH resolved; codex not found, so configure LLM_API_KEY fallback; logs: /tmp/ai-report.log"; \
+		echo "Cron installed: $$cron_role at $$cron_hour:$$cron_minute, tool PATH resolved; codex not found, so configure LLM_API_KEY fallback; logs: /tmp/ai-report.log"; \
 	fi
 
 uninstall-cron:

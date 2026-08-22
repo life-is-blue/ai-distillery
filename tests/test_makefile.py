@@ -55,7 +55,32 @@ class InstallCronTests(unittest.TestCase):
             expected_path = f"{tmp_path}:/usr/local/bin:/usr/bin:/bin"
             self.assertIn(f"export PATH={expected_path};", installed)
             self.assertIn(str(fake_codex), result.stdout)
+            self.assertIn("47 8 * * *", installed)
+            self.assertIn("make leader", installed)
             self.assertNotIn("/data/home/", installed)
+
+            subprocess.run(
+                ["make", "install-cron", "CRON_ROLE=collector"],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            installed = cron_state.read_text()
+            self.assertEqual(installed.count("# ai-distillery-cron"), 1)
+            self.assertIn("47 7 * * *", installed)
+            self.assertIn("make collector", installed)
+
+            invalid = subprocess.run(
+                ["make", "install-cron", "CRON_ROLE=both"],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(invalid.returncode, 2)
+            self.assertIn("CRON_ROLE must be leader or collector", invalid.stderr)
 
             env["CRON_FAIL"] = "1"
             failed = subprocess.run(
