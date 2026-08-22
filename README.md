@@ -24,7 +24,7 @@ graph LR
 
 ## 蒸馏管线
 
-每天 cron 自动执行完整链路：
+每天由一台 leader 自动执行完整链路：
 
 ```
 harvest → report → push → soul → dream → lessons → distill → gene-health → daily → sync-memory
@@ -52,6 +52,8 @@ harvest → report → push → soul → dream → lessons → distill → gene-
 | `gene-health` | Gene 新鲜度衰减模型，registry 重建，晋升建议 |
 | `daily` | 每日健康报告：知识摘要、重复检测、规则新鲜度、链路健康、可操作建议（纯机械，不调 LLM） |
 | `sync-memory` | 提交并推送到远端知识仓库，供 git-library MCP 检索分发 |
+
+多机部署采用“原始日志多写、派生知识单写”：每台 collector 只采集并同步唯一会话文件，唯一 leader 负责生成 SOUL、MEMORY、LESSONS、AGENTS 和报告。
 
 ## 自我迭代是怎么发生的
 
@@ -107,18 +109,26 @@ python3 ai_log_converter.py --slop input.jsonl output.md
 # 新机器一键部署
 make setup
 
-# 全量采集 + 蒸馏全链路（日常 cron 做的事）
-make harvest && make report && make push && make soul && make dream && make lessons && make distill && make gene-health && make daily && make sync-memory
+# 单机或唯一 leader：采集 + 完整蒸馏 + 同步
+make leader
+
+# 其他机器：只采集原始日志并同步
+make collector
 
 # 历史数据回填（选 top 8 天重跑 soul 提取）
 make backfill-soul && make dream
 
-# 安装 cron（每天 08:47 自动执行）
+# leader 默认每天 08:47 执行
 make install-cron
+
+# collector 默认每天 07:47 执行
+make install-cron CRON_ROLE=collector
 
 # 创建一个方法论 Gene
 scripts/extract-gene.sh plan-before-act
 ```
+
+`make install-cron` 会自动解析 `codex`、`python3`、`git`、`make` 的安装目录并写入精简后的 cron `PATH`，因此无需配置机器专属路径，也不会把过长的交互式 `PATH` 塞进 crontab。可用 `CRON_HOUR`、`CRON_MINUTE` 覆盖默认时间；安装或切换 Codex 后重新执行即可更新。collector 不调用 LLM；leader 未安装 Codex 时需在 `.env` 配置 `LLM_API_KEY`。
 
 ## 架构
 

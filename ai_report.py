@@ -3161,22 +3161,53 @@ def cmd_sync_memory(args):
         print(f"sync-memory: {logs_dir} is not a git repo (no .git/)", file=sys.stderr)
         sys.exit(1)
 
+    def git_error_text(exc):
+        stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else str(exc.stderr or "")
+        stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else str(exc.stdout or "")
+        return f"{stderr}\n{stdout}".strip()
+
+    def is_non_fast_forward(exc):
+        detail = git_error_text(exc).lower()
+        return "non-fast-forward" in detail or "fetch first" in detail
+
+    committed = False
     try:
         subprocess.run(["git", "add", "-A"], cwd=str(logs_dir), check=True,
                       capture_output=True, timeout=30)
-        # Idempotent: skip if nothing changed
+        # Commit new files when present, but still push when clean: a previous
+        # run may have committed successfully and then lost the network race.
         result = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=str(logs_dir),
                                capture_output=True, timeout=10)
-        if result.returncode == 0:
-            print("sync-memory: no changes to commit", file=sys.stderr); return
-        today_str = date.today().isoformat()
-        subprocess.run(["git", "commit", "-m", f"chore: sync {today_str}"],
-                      cwd=str(logs_dir), check=True, capture_output=True, timeout=30)
-        subprocess.run(["git", "push"], cwd=str(logs_dir), check=True,
-                      capture_output=True, timeout=120)
-        print(f"OK sync-memory: committed and pushed to ai-memory", file=sys.stderr)
+        if result.returncode != 0:
+            today_str = date.today().isoformat()
+            subprocess.run(["git", "commit", "-m", f"chore: sync {today_str}"],
+                          cwd=str(logs_dir), check=True, capture_output=True, timeout=30)
+            committed = True
+
+        for attempt in range(3):
+            try:
+                subprocess.run(["git", "push"], cwd=str(logs_dir), check=True,
+                              capture_output=True, timeout=120)
+                if committed:
+                    print("OK sync-memory: committed and pushed to ai-memory", file=sys.stderr)
+                else:
+                    print("sync-memory: no new changes; pending commits pushed", file=sys.stderr)
+                return
+            except subprocess.CalledProcessError as push_error:
+                if attempt == 2 or not is_non_fast_forward(push_error):
+                    raise
+                print(f"sync-memory: remote advanced, rebasing ({attempt + 1}/2)", file=sys.stderr)
+                try:
+                    subprocess.run(["git", "pull", "--rebase"], cwd=str(logs_dir), check=True,
+                                  capture_output=True, timeout=120)
+                except subprocess.CalledProcessError:
+                    # Restore the pre-rebase local commit. Never guess at a
+                    # semantic merge for shared SOUL/MEMORY/LESSONS state.
+                    subprocess.run(["git", "rebase", "--abort"], cwd=str(logs_dir),
+                                  capture_output=True, timeout=30)
+                    raise
     except subprocess.CalledProcessError as e:
-        err = e.stderr.decode() if isinstance(e.stderr, bytes) else str(e.stderr or "")
+        err = git_error_text(e)
         print(f"sync-memory git error: {err[:200]}", file=sys.stderr); sys.exit(1)
     except subprocess.TimeoutExpired:
         print("sync-memory: git operation timed out", file=sys.stderr); sys.exit(1)
