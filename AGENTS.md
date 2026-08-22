@@ -67,8 +67,7 @@ ai-distillery/                       ai-memory/ (= ai-memory repo clone)
 ├── scripts/                        ├── claude/gemini/agy/ (raw session data)
 │   └── extract-gene.sh             └── .git/ → (private remote)
 └── .agents/skills/
-    ├── self-improving/SKILL.md
-    └── search-docs/SKILL.md
+    └── self-improving/SKILL.md
 ```
 
 Three files split by change-axis: engine (low freq) / prompts (mid freq) / pipeline (high freq).
